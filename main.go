@@ -118,32 +118,39 @@ type loginAttempt struct {
 	last  time.Time
 }
 
-var loginFails sync.Map // IP(string) → loginAttempt
+var (
+	loginFailsMu  sync.Mutex
+	loginFailsMap = map[string]loginAttempt{}
+)
 
 func checkLoginRateLimit(ip string) bool {
-	v, ok := loginFails.Load(ip)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	a, ok := loginFailsMap[ip]
 	if !ok {
 		return true
 	}
-	a := v.(loginAttempt)
 	// Reset after 1h of inactivity.
 	if time.Since(a.last) > time.Hour {
-		loginFails.Delete(ip)
+		delete(loginFailsMap, ip)
 		return true
 	}
 	return a.count < maxLoginAttempts
 }
 
 func recordLoginFail(ip string) {
-	v, _ := loginFails.LoadOrStore(ip, loginAttempt{})
-	a := v.(loginAttempt)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	a := loginFailsMap[ip]
 	a.count++
 	a.last = time.Now()
-	loginFails.Store(ip, a)
+	loginFailsMap[ip] = a
 }
 
 func clearLoginFail(ip string) {
-	loginFails.Delete(ip)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	delete(loginFailsMap, ip)
 }
 
 func init() {
@@ -157,12 +164,13 @@ func init() {
 				return true
 			})
 			// Evict loginFails entries older than 1h.
-			loginFails.Range(func(k, v any) bool {
-				if now.Sub(v.(loginAttempt).last) > time.Hour {
-					loginFails.Delete(k)
+			loginFailsMu.Lock()
+			for k, v := range loginFailsMap {
+				if now.Sub(v.last) > time.Hour {
+					delete(loginFailsMap, k)
 				}
-				return true
-			})
+			}
+			loginFailsMu.Unlock()
 		}
 	}()
 }
@@ -382,6 +390,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Re-encode JPEG/PNG/GIF to strip EXIF; raw copy for all others.
 	if err := writeUploaded(f, dest, ext); err != nil {
+		os.Remove(dest)
 		log.Printf("upload write error: %v", err)
 		plainErr(w, http.StatusInternalServerError, "Could not save file")
 		return
