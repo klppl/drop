@@ -421,6 +421,10 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 // 50 MP cap on decoded pixel area; guards against decompression-bomb DoS.
 const maxImagePixels = 50_000_000
 
+// imgSem limits concurrent image re-encodes. Each 50 MP decode holds ~200 MB
+// of pixel data; without a cap, many simultaneous uploads can exhaust memory.
+var imgSem = make(chan struct{}, 4)
+
 // writeUploaded re-encodes JPEG/PNG/GIF to strip EXIF; falls back to raw copy on decode error.
 func writeUploaded(src io.ReadSeeker, dest, ext string) error {
 	// Check dimensions before full decode; image.DecodeConfig reads header only.
@@ -434,6 +438,8 @@ func writeUploaded(src io.ReadSeeker, dest, ext string) error {
 		if _, serr := src.Seek(0, io.SeekStart); serr != nil {
 			return serr
 		}
+		imgSem <- struct{}{}
+		defer func() { <-imgSem }()
 	}
 
 	switch ext {
