@@ -1,0 +1,43 @@
+services:
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      # Uncomment for TLS (supply certs and update the template):
+      # - "443:443"
+    environment:
+      # Must equal MAX_FILESIZE + 2 (multipart overhead).
+      # The nginx Docker image substitutes this into default.conf.template at startup.
+      NGINX_MAX_BODY_MIB: ${NGINX_MAX_BODY_MIB:-258}
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+    depends_on:
+      - drop
+
+  drop:
+    build: .
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp  # Go multipart temp files land here
+    environment:
+      # Leave UPLOAD_TOKEN empty for open uploads.
+      UPLOAD_TOKEN:    ${UPLOAD_TOKEN:-}
+      REQUIRE_AUTH:    ${REQUIRE_AUTH:-}
+      MAX_FILESIZE:    ${MAX_FILESIZE:-256}
+      MAX_FILE_AGE:    ${MAX_FILE_AGE:-30}
+      MIN_FILE_AGE:    ${MIN_FILE_AGE:-3}
+      ADMIN_PASSWORD:  ${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set in .env}
+      ADMIN_EMAIL:     ${ADMIN_EMAIL:-admin@example.com}
+      TZ:              ${TZ:-UTC}
+    volumes:
+      - drop_data:/data
+
+volumes:
+  drop_data:

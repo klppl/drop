@@ -1,0 +1,26 @@
+server {
+    listen 80;
+    server_name _;
+
+    # Rendered at container start by the nginx Docker image's envsubst mechanism.
+    # NGINX_MAX_BODY_MIB must equal MAX_FILESIZE + 2 (the +2 covers multipart
+    # form overhead so nginx never 413 a legitimately-sized upload before Go does).
+    client_max_body_size ${NGINX_MAX_BODY_MIB}m;
+
+    # Allow enough time for large uploads through the proxy.
+    proxy_read_timeout  310s;
+    proxy_send_timeout  310s;
+
+    # Disable request buffering: nginx streams the body directly to the Go
+    # backend. Go's MaxBytesReader then enforces the limit immediately without
+    # nginx writing the whole body to a temp file first.
+    proxy_request_buffering off;
+
+    location / {
+        proxy_pass         http://drop:8080;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+}

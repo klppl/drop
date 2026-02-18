@@ -1,0 +1,10 @@
+# Uploaded files and log (stored in Docker volume at runtime)
+data/files/*
+!data/files/.gitkeep
+data/uploads.log
+
+# Local env overrides
+.env
+
+# Go build output
+drop

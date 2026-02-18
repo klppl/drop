@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /home/alex/GitHub/u log --oneline -10)",
+      "Bash(docker images:*)",
+      "Bash(go version:*)",
+      "Bash(rustc:*)",
+      "Bash(php:*)",
+      "WebSearch",
+      "Bash(go build:*)",
+      "Bash(docker run:*)"
+    ]
+  }
+}
