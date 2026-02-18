@@ -2,6 +2,8 @@
 
 A self-hosted file drop service. Upload files via `curl` or browser, share a short link. Dark monospace aesthetic, curl-friendly API, upload auth, an admin panel.
 
+![Frontend](images/screenshot.png)
+
 - Zero runtime dependencies — single Go binary
 - ~12 MB Docker image, ~15 MB RAM at idle
 - Token-protected uploads, password-protected admin panel
@@ -172,6 +174,8 @@ curl "http://localhost?hupl"   -o drop.hupl    # Hupl
 ---
 
 ## Admin panel
+
+![Admin panel](images/admin.png)
 
 Visit `http://localhost/admin` and log in with `ADMIN_PASSWORD`.
 
