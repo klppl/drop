@@ -164,12 +164,29 @@ Visit `http://localhost` — there's an upload form and paste-to-upload (paste a
 
 ### ShareX / Hupl
 
-Download pre-filled config files from the service:
+Download pre-filled config files from the service. When auth is enabled these endpoints require an admin session, so you must log in first and pass the session cookie manually (the cookie's `Path: /admin` means a cookie jar won't include it for `/?sharex`):
 
 ```bash
-curl "http://localhost?sharex" -o drop.sxcu   # ShareX
-curl "http://localhost?hupl"   -o drop.hupl    # Hupl
+# 1. Log in and capture the session token
+SESSION=$(curl -si -X POST http://localhost/admin \
+  -d "password=YOUR_ADMIN_PASSWORD" \
+  | grep -i 'set-cookie:' \
+  | grep -o 'drop_session=[^;]*' \
+  | cut -d= -f2)
+
+# 2. Download the config files
+curl -b "drop_session=$SESSION" "http://localhost?sharex" -o drop.sxcu
+curl -b "drop_session=$SESSION" "http://localhost?hupl"   -o drop.hupl
 ```
+
+If auth is disabled (`REQUIRE_AUTH=false` / no `UPLOAD_TOKEN` set), the plain unauthenticated form works:
+
+```bash
+curl "http://localhost?sharex" -o drop.sxcu
+curl "http://localhost?hupl"   -o drop.hupl
+```
+
+The downloaded configs already contain the upload token (baked in by the server), so you can import them directly into ShareX or Hupl without further configuration.
 
 ---
 
