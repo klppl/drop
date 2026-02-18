@@ -118,32 +118,39 @@ type loginAttempt struct {
 	last  time.Time
 }
 
-var loginFails sync.Map // IP(string) → loginAttempt
+var (
+	loginFails   = make(map[string]loginAttempt)
+	loginFailsMu sync.Mutex
+)
 
 func checkLoginRateLimit(ip string) bool {
-	v, ok := loginFails.Load(ip)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	a, ok := loginFails[ip]
 	if !ok {
 		return true
 	}
-	a := v.(loginAttempt)
 	// Reset after 1h of inactivity.
 	if time.Since(a.last) > time.Hour {
-		loginFails.Delete(ip)
+		delete(loginFails, ip)
 		return true
 	}
 	return a.count < maxLoginAttempts
 }
 
 func recordLoginFail(ip string) {
-	v, _ := loginFails.LoadOrStore(ip, loginAttempt{})
-	a := v.(loginAttempt)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	a := loginFails[ip] // zero value if not present
 	a.count++
 	a.last = time.Now()
-	loginFails.Store(ip, a)
+	loginFails[ip] = a
 }
 
 func clearLoginFail(ip string) {
-	loginFails.Delete(ip)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	delete(loginFails, ip)
 }
 
 func init() {
@@ -157,12 +164,13 @@ func init() {
 				return true
 			})
 			// Evict loginFails entries older than 1h.
-			loginFails.Range(func(k, v any) bool {
-				if now.Sub(v.(loginAttempt).last) > time.Hour {
-					loginFails.Delete(k)
+			loginFailsMu.Lock()
+			for k, v := range loginFails {
+				if now.Sub(v.last) > time.Hour {
+					delete(loginFails, k)
 				}
-				return true
-			})
+			}
+			loginFailsMu.Unlock()
 		}
 	}()
 }
@@ -383,6 +391,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	// Re-encode JPEG/PNG/GIF to strip EXIF; raw copy for all others.
 	if err := writeUploaded(f, dest, ext); err != nil {
 		log.Printf("upload write error: %v", err)
+		os.Remove(dest)
 		plainErr(w, http.StatusInternalServerError, "Could not save file")
 		return
 	}
@@ -886,11 +895,69 @@ func listFiles() ([]fileRow, int, string) {
 }
 
 func tailLog(n int) string {
-	f, err := os.Open(logPath)
+	return tailLogFile(logPath, n)
+}
+
+func tailLogFile(path string, n int) string {
+	f, err := os.Open(path)
 	if err != nil {
 		return "(no log yet)"
 	}
 	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	size := stat.Size()
+	if size == 0 {
+		return ""
+	}
+
+	// Check if file ends with newline to determine newline target count
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, size-1); err != nil {
+		return ""
+	}
+	target := n
+	if buf[0] == '\n' {
+		target++
+	}
+
+	const chunkSize = 4096
+	offset := size
+	newlinesFound := 0
+	chunk := make([]byte, chunkSize)
+
+	for offset > 0 {
+		readSize := int64(chunkSize)
+		if offset < readSize {
+			readSize = offset
+		}
+		readOffset := offset - readSize
+
+		c := chunk[:readSize]
+		if _, err := f.ReadAt(c, readOffset); err != nil {
+			break
+		}
+
+		for i := len(c) - 1; i >= 0; i-- {
+			if c[i] == '\n' {
+				newlinesFound++
+				if newlinesFound >= target {
+					return readLogFromPos(f, readOffset+int64(i)+1, n)
+				}
+			}
+		}
+		offset -= readSize
+	}
+	return readLogFromPos(f, 0, n)
+}
+
+func readLogFromPos(f *os.File, pos int64, n int) string {
+	if _, err := f.Seek(pos, io.SeekStart); err != nil {
+		return ""
+	}
 	var lines []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
