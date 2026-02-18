@@ -107,7 +107,12 @@ func envInt(key string, fallback int) int {
 
 const sessionTTL = 8 * time.Hour
 
-var sessions sync.Map // token(string) → expiry(time.Time)
+type sessionData struct {
+	expiry    time.Time
+	csrfToken string
+}
+
+var sessions sync.Map // token(string) → sessionData
 
 // ── Login rate limiting ───────────────────────────────────────────────────────
 
@@ -118,32 +123,39 @@ type loginAttempt struct {
 	last  time.Time
 }
 
-var loginFails sync.Map // IP(string) → loginAttempt
+var (
+	loginFails   = make(map[string]loginAttempt)
+	loginFailsMu sync.Mutex
+)
 
 func checkLoginRateLimit(ip string) bool {
-	v, ok := loginFails.Load(ip)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	a, ok := loginFails[ip]
 	if !ok {
 		return true
 	}
-	a := v.(loginAttempt)
 	// Reset after 1h of inactivity.
 	if time.Since(a.last) > time.Hour {
-		loginFails.Delete(ip)
+		delete(loginFails, ip)
 		return true
 	}
 	return a.count < maxLoginAttempts
 }
 
 func recordLoginFail(ip string) {
-	v, _ := loginFails.LoadOrStore(ip, loginAttempt{})
-	a := v.(loginAttempt)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	a := loginFails[ip] // zero value if not present
 	a.count++
 	a.last = time.Now()
-	loginFails.Store(ip, a)
+	loginFails[ip] = a
 }
 
 func clearLoginFail(ip string) {
-	loginFails.Delete(ip)
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	delete(loginFails, ip)
 }
 
 func init() {
@@ -151,18 +163,19 @@ func init() {
 		for range time.Tick(30 * time.Minute) {
 			now := time.Now()
 			sessions.Range(func(k, v any) bool {
-				if now.After(v.(time.Time)) {
+				if now.After(v.(sessionData).expiry) {
 					sessions.Delete(k)
 				}
 				return true
 			})
 			// Evict loginFails entries older than 1h.
-			loginFails.Range(func(k, v any) bool {
-				if now.Sub(v.(loginAttempt).last) > time.Hour {
-					loginFails.Delete(k)
+			loginFailsMu.Lock()
+			for k, v := range loginFails {
+				if now.Sub(v.last) > time.Hour {
+					delete(loginFails, k)
 				}
-				return true
-			})
+			}
+			loginFailsMu.Unlock()
 		}
 	}()
 }
@@ -173,7 +186,18 @@ func newSession() string {
 		panic(err)
 	}
 	tok := hex.EncodeToString(b)
-	sessions.Store(tok, time.Now().Add(sessionTTL))
+
+	// Generate CSRF token
+	cb := make([]byte, 32)
+	if _, err := rand.Read(cb); err != nil {
+		panic(err)
+	}
+	csrf := hex.EncodeToString(cb)
+
+	sessions.Store(tok, sessionData{
+		expiry:    time.Now().Add(sessionTTL),
+		csrfToken: csrf,
+	})
 	return tok
 }
 
@@ -186,7 +210,7 @@ func isAdmin(r *http.Request) bool {
 	if !ok {
 		return false
 	}
-	if time.Now().After(v.(time.Time)) {
+	if time.Now().After(v.(sessionData).expiry) {
 		sessions.Delete(c.Value)
 		return false
 	}
@@ -263,6 +287,9 @@ func clientIP(r *http.Request) string {
 }
 
 func siteURL(r *http.Request) string {
+	if s := os.Getenv("SITE_URL"); s != "" {
+		return strings.TrimSuffix(s, "/")
+	}
 	scheme := "http"
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
 		scheme = "https"
@@ -383,6 +410,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	// Re-encode JPEG/PNG/GIF to strip EXIF; raw copy for all others.
 	if err := writeUploaded(f, dest, ext); err != nil {
 		log.Printf("upload write error: %v", err)
+		os.Remove(dest)
 		plainErr(w, http.StatusInternalServerError, "Could not save file")
 		return
 	}
@@ -412,6 +440,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 // 50 MP cap on decoded pixel area; guards against decompression-bomb DoS.
 const maxImagePixels = 50_000_000
 
+// Semaphore to limit concurrent image processing (prevents OOM).
+var imageProcSem = make(chan struct{}, 4)
+
 // writeUploaded re-encodes JPEG/PNG/GIF to strip EXIF; falls back to raw copy on decode error.
 func writeUploaded(src io.ReadSeeker, dest, ext string) error {
 	// Check dimensions before full decode; image.DecodeConfig reads header only.
@@ -429,6 +460,9 @@ func writeUploaded(src io.ReadSeeker, dest, ext string) error {
 
 	switch ext {
 	case "jpg", "jpeg":
+		imageProcSem <- struct{}{}
+		defer func() { <-imageProcSem }()
+
 		img, err := jpeg.Decode(src)
 		if err != nil {
 			if _, serr := src.Seek(0, io.SeekStart); serr != nil {
@@ -444,6 +478,9 @@ func writeUploaded(src io.ReadSeeker, dest, ext string) error {
 		return jpeg.Encode(out, img, &jpeg.Options{Quality: 92})
 
 	case "png":
+		imageProcSem <- struct{}{}
+		defer func() { <-imageProcSem }()
+
 		img, err := png.Decode(src)
 		if err != nil {
 			if _, serr := src.Seek(0, io.SeekStart); serr != nil {
@@ -459,6 +496,9 @@ func writeUploaded(src io.ReadSeeker, dest, ext string) error {
 		return png.Encode(out, img)
 
 	case "gif":
+		imageProcSem <- struct{}{}
+		defer func() { <-imageProcSem }()
+
 		g, err := gif.DecodeAll(src)
 		if err != nil {
 			if _, serr := src.Seek(0, io.SeekStart); serr != nil {
@@ -687,6 +727,7 @@ type adminData struct {
 	Log        string
 	ShowLog    bool
 	MaxAge     int // default value for the purge-days input
+	CSRFToken  string
 }
 
 var adminTpl = template.Must(template.New("admin").Parse(`<!doctype html>
@@ -721,6 +762,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   <td>{{.ExpiresIn}}</td>
   <td><form method="POST" action="/admin" onsubmit="return confirm('Delete {{.Name}}?')">
     <input type="hidden" name="action" value="delete">
+    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
     <input type="hidden" name="file" value="{{.Name}}">
     <button class="danger">del</button>
   </form></td>
@@ -729,6 +771,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 <hr>
 <form method="POST" action="/admin">
   <input type="hidden" name="action" value="purge">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   Delete files older than
   <input type="number" name="days" value="{{.MaxAge}}" min="1" max="9999" style="width:4em"> days
   <button onclick="return confirm('Purge old files?')">purge</button>
@@ -736,12 +779,14 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 <hr>
 <form method="POST" action="/admin">
   <input type="hidden" name="action" value="viewlog">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <button>view log</button>
 </form>
 {{if .ShowLog}}<pre>{{.Log}}</pre>{{end}}
 <hr>
 <form method="POST" action="/admin">
   <input type="hidden" name="action" value="logout">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <button>logout</button>
 </form>
 {{else}}
@@ -764,6 +809,8 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		action := r.FormValue("action")
 
 		if action == "logout" {
+			// Logout doesn't strictly need CSRF check if it just clears cookie,
+			// but good practice. However, if session is invalid, we just redirect.
 			destroySession(r)
 			http.Redirect(w, r, "/admin", http.StatusSeeOther)
 			return
@@ -798,7 +845,22 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Verify CSRF token for authenticated actions
+		c, _ := r.Cookie("drop_session")
+		v, ok := sessions.Load(c.Value)
+		if !ok {
+			// Session expired or invalid
+			http.Redirect(w, r, "/admin", http.StatusSeeOther)
+			return
+		}
+		sess := v.(sessionData)
+		if !secureEqual(r.FormValue("csrf_token"), sess.csrfToken) {
+			plainErr(w, http.StatusBadRequest, "Invalid CSRF token")
+			return
+		}
+
 		data.LoggedIn = true
+		data.CSRFToken = sess.csrfToken
 		switch action {
 		case "delete":
 			name := r.FormValue("file")
@@ -828,6 +890,10 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 	if isAdmin(r) {
 		data.LoggedIn = true
+		c, _ := r.Cookie("drop_session")
+		if v, ok := sessions.Load(c.Value); ok {
+			data.CSRFToken = v.(sessionData).csrfToken
+		}
 		data.Files, data.TotalCount, data.TotalSize = listFiles()
 	}
 	adminTpl.Execute(w, data)
@@ -886,11 +952,69 @@ func listFiles() ([]fileRow, int, string) {
 }
 
 func tailLog(n int) string {
-	f, err := os.Open(logPath)
+	return tailLogFile(logPath, n)
+}
+
+func tailLogFile(path string, n int) string {
+	f, err := os.Open(path)
 	if err != nil {
 		return "(no log yet)"
 	}
 	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	size := stat.Size()
+	if size == 0 {
+		return ""
+	}
+
+	// Check if file ends with newline to determine newline target count
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, size-1); err != nil {
+		return ""
+	}
+	target := n
+	if buf[0] == '\n' {
+		target++
+	}
+
+	const chunkSize = 4096
+	offset := size
+	newlinesFound := 0
+	chunk := make([]byte, chunkSize)
+
+	for offset > 0 {
+		readSize := int64(chunkSize)
+		if offset < readSize {
+			readSize = offset
+		}
+		readOffset := offset - readSize
+
+		c := chunk[:readSize]
+		if _, err := f.ReadAt(c, readOffset); err != nil {
+			break
+		}
+
+		for i := len(c) - 1; i >= 0; i-- {
+			if c[i] == '\n' {
+				newlinesFound++
+				if newlinesFound >= target {
+					return readLogFromPos(f, readOffset+int64(i)+1, n)
+				}
+			}
+		}
+		offset -= readSize
+	}
+	return readLogFromPos(f, 0, n)
+}
+
+func readLogFromPos(f *os.File, pos int64, n int) string {
+	if _, err := f.Seek(pos, io.SeekStart); err != nil {
+		return ""
+	}
 	var lines []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
