@@ -29,14 +29,15 @@ import (
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const (
-	decayExp      = 2
-	minIDLen      = 4
-	maxIDLen      = 24
-	maxExtLen     = 7
-	storePath     = "/data/files/"
-	logPath       = "/data/uploads.log"
-	extConfigPath = "/data/extensions.json"
-	filePrefix    = "/f/"
+	decayExp        = 2
+	minIDLen        = 4
+	maxIDLen        = 24
+	maxExtLen       = 7
+	storePath       = "/data/files/"
+	logPath         = "/data/uploads.log"
+	extConfigPath   = "/data/extensions.json"
+	tokenConfigPath = "/data/tokens.json"
+	filePrefix      = "/f/"
 )
 
 var (
@@ -59,6 +60,7 @@ func loadConfig() {
 	}
 
 	loadAllowedExts()
+	loadAppTokens()
 }
 
 var (
@@ -142,6 +144,126 @@ func loadAllowedExts() {
 	allowedExtsMu.Lock()
 	allowedExts = m
 	allowedExtsMu.Unlock()
+}
+
+// ── App tokens ────────────────────────────────────────────────────────────────
+
+type appToken struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Token   string `json:"token"`
+	Created string `json:"created"`
+}
+
+var (
+	appTokensMu sync.RWMutex
+	appTokens   []appToken
+)
+
+func loadAppTokens() {
+	data, err := os.ReadFile(tokenConfigPath)
+	if err != nil {
+		return
+	}
+	var tokens []appToken
+	if err := json.Unmarshal(data, &tokens); err != nil {
+		log.Printf("failed to parse %s: %v", tokenConfigPath, err)
+		return
+	}
+	appTokensMu.Lock()
+	appTokens = tokens
+	appTokensMu.Unlock()
+}
+
+func saveAppTokensLocked() {
+	data, err := json.MarshalIndent(appTokens, "", "  ")
+	if err != nil {
+		log.Printf("failed to marshal app tokens: %v", err)
+		return
+	}
+	if err := os.WriteFile(tokenConfigPath, data, 0644); err != nil {
+		log.Printf("failed to save app tokens: %v", err)
+	}
+}
+
+func hasAppTokens() bool {
+	appTokensMu.RLock()
+	defer appTokensMu.RUnlock()
+	return len(appTokens) > 0
+}
+
+func isValidAppToken(token string) bool {
+	appTokensMu.RLock()
+	defer appTokensMu.RUnlock()
+	for _, t := range appTokens {
+		if secureEqual(token, t.Token) {
+			return true
+		}
+	}
+	return false
+}
+
+func getAppTokens() []appToken {
+	appTokensMu.RLock()
+	defer appTokensMu.RUnlock()
+	out := make([]appToken, len(appTokens))
+	copy(out, appTokens)
+	return out
+}
+
+func getAppTokenByID(id string) (appToken, bool) {
+	appTokensMu.RLock()
+	defer appTokensMu.RUnlock()
+	for _, t := range appTokens {
+		if t.ID == id {
+			return t, true
+		}
+	}
+	return appToken{}, false
+}
+
+func generateAppToken(name string) appToken {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	t := appToken{
+		ID:      randID(8),
+		Name:    name,
+		Token:   hex.EncodeToString(b),
+		Created: time.Now().UTC().Format(time.RFC3339),
+	}
+	appTokensMu.Lock()
+	appTokens = append(appTokens, t)
+	saveAppTokensLocked()
+	appTokensMu.Unlock()
+	return t
+}
+
+func revokeAppToken(id string) bool {
+	appTokensMu.Lock()
+	defer appTokensMu.Unlock()
+	for i, t := range appTokens {
+		if t.ID == id {
+			appTokens = append(appTokens[:i], appTokens[i+1:]...)
+			saveAppTokensLocked()
+			return true
+		}
+	}
+	return false
+}
+
+func adminTokenRows() []adminTokenRow {
+	tokens := getAppTokens()
+	rows := make([]adminTokenRow, len(tokens))
+	for i, t := range tokens {
+		created := t.Created
+		if ts, err := time.Parse(time.RFC3339, t.Created); err == nil {
+			created = ts.Format("2006-01-02")
+		}
+		rows[i] = adminTokenRow{ID: t.ID, Name: t.Name, Created: created}
+	}
+	return rows
 }
 
 // Formats served inline; all others force download. Only re-encoded rasters are
@@ -375,8 +497,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Check auth headers first; form token checked post-ParseMultipartForm.
 	uploadToken := os.Getenv("UPLOAD_TOKEN")
-	if cfgRequireAuth && uploadToken == "" {
-		// Empty token would match any empty form value — treat as misconfiguration.
+	useAppTokens := hasAppTokens()
+	if cfgRequireAuth && !useAppTokens && uploadToken == "" {
 		plainErr(w, http.StatusInternalServerError,
 			"Server misconfiguration: UPLOAD_TOKEN must be set when REQUIRE_AUTH is true")
 		return
@@ -386,17 +508,27 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		// Logged-in admin session — skip token auth entirely.
 	} else if cfgRequireAuth {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			if !secureEqual(strings.TrimPrefix(auth, "Bearer "), uploadToken) {
+			tok := strings.TrimPrefix(auth, "Bearer ")
+			if useAppTokens {
+				if !isValidAppToken(tok) {
+					plainErr(w, http.StatusUnauthorized, "Unauthorized")
+					return
+				}
+			} else if !secureEqual(tok, uploadToken) {
 				plainErr(w, http.StatusUnauthorized, "Unauthorized")
 				return
 			}
 		} else if h := r.Header.Get("X-Upload-Token"); h != "" {
-			if !secureEqual(h, uploadToken) {
+			if useAppTokens {
+				if !isValidAppToken(h) {
+					plainErr(w, http.StatusUnauthorized, "Unauthorized")
+					return
+				}
+			} else if !secureEqual(h, uploadToken) {
 				plainErr(w, http.StatusUnauthorized, "Unauthorized")
 				return
 			}
 		} else {
-			// No header token; fall through to form field check.
 			needFormToken = true
 		}
 	}
@@ -407,9 +539,17 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Browser form token check.
-	if needFormToken && !secureEqual(r.FormValue("token"), uploadToken) {
-		plainErr(w, http.StatusUnauthorized, "Unauthorized")
-		return
+	if needFormToken {
+		formTok := r.FormValue("token")
+		if useAppTokens {
+			if !isValidAppToken(formTok) {
+				plainErr(w, http.StatusUnauthorized, "Unauthorized")
+				return
+			}
+		} else if !secureEqual(formTok, uploadToken) {
+			plainErr(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
 	}
 
 	f, hdr, err := r.FormFile("file")
@@ -773,6 +913,10 @@ type fileRow struct {
 	Name, Size, Age, ExpiresIn string
 }
 
+type adminTokenRow struct {
+	ID, Name, Created string
+}
+
 type adminData struct {
 	LoggedIn   bool
 	Flash      string
@@ -784,6 +928,8 @@ type adminData struct {
 	ShowLog    bool
 	MaxAge     int // default value for the purge-days input
 	Extensions []string
+	Tokens     []adminTokenRow
+	NewToken   string // shown once after generation
 }
 
 var adminTpl = template.Must(template.New("admin").Parse(`<!doctype html>
@@ -851,7 +997,29 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 </form>
 {{if .ShowLog}}<pre>{{.Log}}</pre>{{end}}
 <hr>
-<p><a href="/?sharex">download ShareX config</a> &nbsp;&middot;&nbsp; <a href="/?hupl">download Hupl config</a></p>
+<p style="color:#555;margin-bottom:.5em">&mdash; api tokens &mdash;</p>
+{{if .NewToken}}<div class="flash" style="word-break:break-all">New token: <code>{{.NewToken}}</code><br><small style="color:#555">Copy now — it won't be shown again.</small></div>{{end}}
+{{if .Tokens}}
+<table>
+<tr><th>name</th><th>created</th><th>config</th><th></th></tr>
+{{range .Tokens}}<tr>
+  <td>{{.Name}}</td>
+  <td>{{.Created}}</td>
+  <td><a href="/?sharex&token={{.ID}}">sharex</a> &middot; <a href="/?hupl&token={{.ID}}">hupl</a></td>
+  <td><form method="POST" action="/admin" onsubmit="return confirm('Revoke token {{.Name}}?')">
+    <input type="hidden" name="action" value="revoke_token">
+    <input type="hidden" name="token_id" value="{{.ID}}">
+    <button class="danger">revoke</button>
+  </form></td>
+</tr>{{end}}
+</table>
+{{else}}<p class="dim">No app tokens yet. Generate one to use instead of the master upload token.</p>{{end}}
+<form method="POST" action="/admin" style="margin:.5em 0 1em">
+  <input type="hidden" name="action" value="gen_token">
+  <input type="text" name="token_name" placeholder="label (e.g. ShareX laptop)" maxlength="32" style="width:20em">
+  <button>generate</button>
+</form>
+{{if not .Tokens}}<p><a href="/?sharex">download ShareX config</a> &nbsp;&middot;&nbsp; <a href="/?hupl">download Hupl config</a></p>{{end}}
 <hr>
 <form method="POST" action="/admin">
   <input type="hidden" name="action" value="logout">
@@ -948,10 +1116,27 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 				removeAllowedExt(ext)
 				data.Flash = "Removed extension: " + ext
 			}
+		case "gen_token":
+			name := strings.TrimSpace(r.FormValue("token_name"))
+			if name == "" || len(name) > 32 {
+				data.ErrMsg = "Token label must be 1-32 characters"
+			} else {
+				t := generateAppToken(name)
+				data.NewToken = t.Token
+				data.Flash = fmt.Sprintf("Generated token %q", name)
+			}
+		case "revoke_token":
+			id := r.FormValue("token_id")
+			if revokeAppToken(id) {
+				data.Flash = "Token revoked"
+			} else {
+				data.ErrMsg = "Token not found"
+			}
 		case "viewlog":
 			data.Log = tailLog(200)
 			data.ShowLog = true
 		}
+		data.Tokens = adminTokenRows()
 		data.Extensions = getAllowedExts()
 		data.Files, data.TotalCount, data.TotalSize = listFiles()
 		adminTpl.Execute(w, data)
@@ -961,6 +1146,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	if isAdmin(r) {
 		data.LoggedIn = true
 		data.Extensions = getAllowedExts()
+		data.Tokens = adminTokenRows()
 		data.Files, data.TotalCount, data.TotalSize = listFiles()
 	}
 	adminTpl.Execute(w, data)
@@ -1142,18 +1328,35 @@ document.addEventListener('paste', function(e) {
 
 // ── ShareX / Hupl configs ─────────────────────────────────────────────────────
 
+func resolveConfigToken(r *http.Request) (string, error) {
+	if id := r.URL.Query().Get("token"); id != "" {
+		t, ok := getAppTokenByID(id)
+		if !ok {
+			return "", fmt.Errorf("unknown token ID")
+		}
+		return t.Token, nil
+	}
+	if hasAppTokens() {
+		return "", fmt.Errorf("app tokens exist; specify ?token=<id>")
+	}
+	return os.Getenv("UPLOAD_TOKEN"), nil
+}
+
 func serveShareX(w http.ResponseWriter, r *http.Request) {
 	if cfgRequireAuth && !isAdmin(r) {
 		plainErr(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
-	tok := os.Getenv("UPLOAD_TOKEN")
+	tok, err := resolveConfigToken(r)
+	if err != nil {
+		plainErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	headers := ""
 	if tok != "" {
 		headers = fmt.Sprintf(`,
   "Headers": {"Authorization": "Bearer %s"}`, tok)
 	}
-	// json.Marshal escapes the URL to prevent Host-header injection.
 	urlJSON, _ := json.Marshal(siteURL(r))
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", `attachment; filename="drop.sxcu"`)
@@ -1174,7 +1377,11 @@ func serveHupl(w http.ResponseWriter, r *http.Request) {
 		plainErr(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
-	tok := os.Getenv("UPLOAD_TOKEN")
+	tok, err := resolveConfigToken(r)
+	if err != nil {
+		plainErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	auth := ""
 	if tok != "" {
 		auth = fmt.Sprintf(`"Authorization": "Bearer %s"`, tok)
@@ -1207,11 +1414,12 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	switch r.URL.RawQuery {
-	case "sharex":
+	q := r.URL.Query()
+	if _, ok := q["sharex"]; ok {
 		serveShareX(w, r)
 		return
-	case "hupl":
+	}
+	if _, ok := q["hupl"]; ok {
 		serveHupl(w, r)
 		return
 	}
