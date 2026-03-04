@@ -41,26 +41,57 @@ const (
 )
 
 var (
-	cfgMaxFilesizeMiB int // MAX_FILESIZE (MiB)
-	cfgMaxFileAgeDays int // MAX_FILE_AGE (days)
-	cfgMinFileAgeDays int // MIN_FILE_AGE (days)
-	cfgRequireAuth    bool // REQUIRE_AUTH (true/false); default: true when UPLOAD_TOKEN is set
+	cfgMaxFilesizeMiB int    // MAX_FILESIZE (MiB)
+	cfgMaxFileAgeDays int    // MAX_FILE_AGE (days)
+	cfgMinFileAgeDays int    // MIN_FILE_AGE (days)
+	cfgRequireAuth    bool   // REQUIRE_AUTH (true/false); default: true when UPLOAD_TOKEN is set
+	cfgUploadToken    string // UPLOAD_TOKEN
+	cfgAdminPassword  string // ADMIN_PASSWORD
+	cfgAdminEmail     string // ADMIN_EMAIL
 )
 
 func loadConfig() {
 	cfgMaxFilesizeMiB = envInt("MAX_FILESIZE", 256)
 	cfgMaxFileAgeDays = envInt("MAX_FILE_AGE", 30)
 	cfgMinFileAgeDays = envInt("MIN_FILE_AGE", 3)
+	cfgUploadToken = os.Getenv("UPLOAD_TOKEN")
+	cfgAdminPassword = env("ADMIN_PASSWORD", "changeme")
+	cfgAdminEmail = env("ADMIN_EMAIL", "admin@example.com")
 
 	// Defaults to true when UPLOAD_TOKEN is set; REQUIRE_AUTH=false overrides.
 	if v := os.Getenv("REQUIRE_AUTH"); v != "" {
 		cfgRequireAuth = v != "false" && v != "0"
 	} else {
-		cfgRequireAuth = os.Getenv("UPLOAD_TOKEN") != ""
+		cfgRequireAuth = cfgUploadToken != ""
 	}
 
 	loadAllowedExts()
 	loadAppTokens()
+}
+
+// loadJSON reads a JSON file into dest. Returns false if the file doesn't exist.
+func loadJSON(path string, dest any) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	if err := json.Unmarshal(data, dest); err != nil {
+		log.Printf("failed to parse %s: %v", path, err)
+		return false
+	}
+	return true
+}
+
+// saveJSON writes data as indented JSON to path.
+func saveJSON(path string, data any) {
+	b, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		log.Printf("failed to marshal JSON for %s: %v", path, err)
+		return
+	}
+	if err := os.WriteFile(path, b, 0644); err != nil {
+		log.Printf("failed to save %s: %v", path, err)
+	}
 }
 
 var (
@@ -113,26 +144,14 @@ func saveAllowedExtsLocked() {
 		exts = append(exts, k)
 	}
 	sort.Strings(exts)
-	data, err := json.MarshalIndent(exts, "", "  ")
-	if err != nil {
-		log.Printf("failed to marshal extensions: %v", err)
-		return
-	}
-	if err := os.WriteFile(extConfigPath, data, 0644); err != nil {
-		log.Printf("failed to save extensions config: %v", err)
-	}
+	saveJSON(extConfigPath, exts)
 }
 
 // loadAllowedExts loads extensions from disk if the config file exists.
 func loadAllowedExts() {
-	data, err := os.ReadFile(extConfigPath)
-	if err != nil {
-		return // file doesn't exist yet; keep hardcoded defaults
-	}
 	var exts []string
-	if err := json.Unmarshal(data, &exts); err != nil {
-		log.Printf("failed to parse %s: %v", extConfigPath, err)
-		return
+	if !loadJSON(extConfigPath, &exts) {
+		return // file doesn't exist yet; keep hardcoded defaults
 	}
 	m := make(map[string]bool, len(exts))
 	for _, e := range exts {
@@ -161,13 +180,8 @@ var (
 )
 
 func loadAppTokens() {
-	data, err := os.ReadFile(tokenConfigPath)
-	if err != nil {
-		return
-	}
 	var tokens []appToken
-	if err := json.Unmarshal(data, &tokens); err != nil {
-		log.Printf("failed to parse %s: %v", tokenConfigPath, err)
+	if !loadJSON(tokenConfigPath, &tokens) {
 		return
 	}
 	appTokensMu.Lock()
@@ -175,15 +189,9 @@ func loadAppTokens() {
 	appTokensMu.Unlock()
 }
 
+// saveAppTokensLocked writes app tokens to disk. Caller must hold appTokensMu.
 func saveAppTokensLocked() {
-	data, err := json.MarshalIndent(appTokens, "", "  ")
-	if err != nil {
-		log.Printf("failed to marshal app tokens: %v", err)
-		return
-	}
-	if err := os.WriteFile(tokenConfigPath, data, 0644); err != nil {
-		log.Printf("failed to save app tokens: %v", err)
-	}
+	saveJSON(tokenConfigPath, appTokens)
 }
 
 func hasAppTokens() bool {
@@ -223,14 +231,10 @@ func getAppTokenByID(id string) (appToken, bool) {
 }
 
 func generateAppToken(name string) appToken {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
-	}
 	t := appToken{
 		ID:      randID(8),
 		Name:    name,
-		Token:   hex.EncodeToString(b),
+		Token:   randHex(32),
 		Created: time.Now().UTC().Format(time.RFC3339),
 	}
 	appTokensMu.Lock()
@@ -308,7 +312,12 @@ func envInt(key string, fallback int) int {
 
 const sessionTTL = 8 * time.Hour
 
-var sessions sync.Map // token(string) → expiry(time.Time)
+type sessionData struct {
+	expiry time.Time
+	csrf   string
+}
+
+var sessions sync.Map // token(string) → sessionData
 
 // ── Login rate limiting ───────────────────────────────────────────────────────
 
@@ -321,19 +330,19 @@ type loginAttempt struct {
 
 var (
 	loginFailsMu  sync.Mutex
-	loginFailsMap = map[string]loginAttempt{}
+	loginFails = map[string]loginAttempt{}
 )
 
 func checkLoginRateLimit(ip string) bool {
 	loginFailsMu.Lock()
 	defer loginFailsMu.Unlock()
-	a, ok := loginFailsMap[ip]
+	a, ok := loginFails[ip]
 	if !ok {
 		return true
 	}
 	// Reset after 1h of inactivity.
 	if time.Since(a.last) > time.Hour {
-		delete(loginFailsMap, ip)
+		delete(loginFails, ip)
 		return true
 	}
 	return a.count < maxLoginAttempts
@@ -342,16 +351,52 @@ func checkLoginRateLimit(ip string) bool {
 func recordLoginFail(ip string) {
 	loginFailsMu.Lock()
 	defer loginFailsMu.Unlock()
-	a := loginFailsMap[ip]
+	a := loginFails[ip]
 	a.count++
 	a.last = time.Now()
-	loginFailsMap[ip] = a
+	loginFails[ip] = a
 }
 
 func clearLoginFail(ip string) {
 	loginFailsMu.Lock()
 	defer loginFailsMu.Unlock()
-	delete(loginFailsMap, ip)
+	delete(loginFails, ip)
+}
+
+// ── Upload rate limiting ──────────────────────────────────────────────────────
+
+const (
+	maxUploadsPerHour = 60
+	uploadRateWindow  = time.Hour
+)
+
+type uploadCounter struct {
+	count int
+	reset time.Time // window expiry
+}
+
+var (
+	uploadRateMu sync.Mutex
+	uploadRates  = map[string]uploadCounter{}
+)
+
+// checkUploadRateLimit returns true if the IP has uploads remaining in the current window.
+func checkUploadRateLimit(ip string) bool {
+	uploadRateMu.Lock()
+	defer uploadRateMu.Unlock()
+	c := uploadRates[ip]
+	now := time.Now()
+	if now.After(c.reset) {
+		// Start a new window.
+		uploadRates[ip] = uploadCounter{count: 1, reset: now.Add(uploadRateWindow)}
+		return true
+	}
+	if c.count >= maxUploadsPerHour {
+		return false
+	}
+	c.count++
+	uploadRates[ip] = c
+	return true
 }
 
 func init() {
@@ -359,30 +404,37 @@ func init() {
 		for range time.Tick(30 * time.Minute) {
 			now := time.Now()
 			sessions.Range(func(k, v any) bool {
-				if now.After(v.(time.Time)) {
+				if now.After(v.(sessionData).expiry) {
 					sessions.Delete(k)
 				}
 				return true
 			})
 			// Evict loginFails entries older than 1h.
 			loginFailsMu.Lock()
-			for k, v := range loginFailsMap {
+			for k, v := range loginFails {
 				if now.Sub(v.last) > time.Hour {
-					delete(loginFailsMap, k)
+					delete(loginFails, k)
 				}
 			}
 			loginFailsMu.Unlock()
+			// Evict expired upload rate counters.
+			uploadRateMu.Lock()
+			for k, v := range uploadRates {
+				if now.After(v.reset) {
+					delete(uploadRates, k)
+				}
+			}
+			uploadRateMu.Unlock()
 		}
 	}()
 }
 
 func newSession() string {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
-	}
-	tok := hex.EncodeToString(b)
-	sessions.Store(tok, time.Now().Add(sessionTTL))
+	tok := randHex(32)
+	sessions.Store(tok, sessionData{
+		expiry: time.Now().Add(sessionTTL),
+		csrf:   randHex(16),
+	})
 	return tok
 }
 
@@ -395,11 +447,31 @@ func isAdmin(r *http.Request) bool {
 	if !ok {
 		return false
 	}
-	if time.Now().After(v.(time.Time)) {
+	sd := v.(sessionData)
+	if time.Now().After(sd.expiry) {
 		sessions.Delete(c.Value)
 		return false
 	}
 	return true
+}
+
+// csrfToken returns the CSRF token for the current session, or empty string.
+func csrfToken(r *http.Request) string {
+	c, err := r.Cookie("drop_session")
+	if err != nil {
+		return ""
+	}
+	v, ok := sessions.Load(c.Value)
+	if !ok {
+		return ""
+	}
+	return v.(sessionData).csrf
+}
+
+// validCSRF checks that the form's csrf field matches the session's CSRF token.
+func validCSRF(r *http.Request) bool {
+	tok := csrfToken(r)
+	return tok != "" && secureEqual(r.FormValue("csrf"), tok)
 }
 
 func destroySession(r *http.Request) {
@@ -420,6 +492,42 @@ func randID(n int) string {
 		out[i] = idAlphabet[int(v)%len(idAlphabet)]
 	}
 	return string(out)
+}
+
+// randHex returns a cryptographically random hex string of n bytes (2n hex chars).
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
+}
+
+// storeFile holds metadata for a file in storePath.
+type storeFile struct {
+	name  string
+	size  int64
+	mtime time.Time
+}
+
+// readStoreFiles returns metadata for all regular files in storePath.
+func readStoreFiles() []storeFile {
+	entries, err := os.ReadDir(storePath)
+	if err != nil {
+		return nil
+	}
+	files := make([]storeFile, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, storeFile{e.Name(), info.Size(), info.ModTime()})
+	}
+	return files
 }
 
 // retentionDays returns how many days a file of the given size should live.
@@ -489,6 +597,14 @@ func secureEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
+// validateUploadToken checks a token against app tokens (if any) or the master upload token.
+func validateUploadToken(tok string) bool {
+	if hasAppTokens() {
+		return isValidAppToken(tok)
+	}
+	return secureEqual(tok, cfgUploadToken)
+}
+
 // ── Upload ────────────────────────────────────────────────────────────────────
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -496,9 +612,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, int64(cfgMaxFilesizeMiB+2)*1024*1024)
 
 	// Check auth headers first; form token checked post-ParseMultipartForm.
-	uploadToken := os.Getenv("UPLOAD_TOKEN")
-	useAppTokens := hasAppTokens()
-	if cfgRequireAuth && !useAppTokens && uploadToken == "" {
+	if cfgRequireAuth && !hasAppTokens() && cfgUploadToken == "" {
 		plainErr(w, http.StatusInternalServerError,
 			"Server misconfiguration: UPLOAD_TOKEN must be set when REQUIRE_AUTH is true")
 		return
@@ -508,23 +622,12 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		// Logged-in admin session — skip token auth entirely.
 	} else if cfgRequireAuth {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			tok := strings.TrimPrefix(auth, "Bearer ")
-			if useAppTokens {
-				if !isValidAppToken(tok) {
-					plainErr(w, http.StatusUnauthorized, "Unauthorized")
-					return
-				}
-			} else if !secureEqual(tok, uploadToken) {
+			if !validateUploadToken(strings.TrimPrefix(auth, "Bearer ")) {
 				plainErr(w, http.StatusUnauthorized, "Unauthorized")
 				return
 			}
 		} else if h := r.Header.Get("X-Upload-Token"); h != "" {
-			if useAppTokens {
-				if !isValidAppToken(h) {
-					plainErr(w, http.StatusUnauthorized, "Unauthorized")
-					return
-				}
-			} else if !secureEqual(h, uploadToken) {
+			if !validateUploadToken(h) {
 				plainErr(w, http.StatusUnauthorized, "Unauthorized")
 				return
 			}
@@ -539,17 +642,16 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Browser form token check.
-	if needFormToken {
-		formTok := r.FormValue("token")
-		if useAppTokens {
-			if !isValidAppToken(formTok) {
-				plainErr(w, http.StatusUnauthorized, "Unauthorized")
-				return
-			}
-		} else if !secureEqual(formTok, uploadToken) {
-			plainErr(w, http.StatusUnauthorized, "Unauthorized")
-			return
-		}
+	if needFormToken && !validateUploadToken(r.FormValue("token")) {
+		plainErr(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// Per-IP upload rate limit.
+	if !checkUploadRateLimit(clientIP(r)) {
+		plainErr(w, http.StatusTooManyRequests,
+			fmt.Sprintf("Upload rate limit exceeded (%d/hour)", maxUploadsPerHour))
+		return
 	}
 
 	f, hdr, err := r.FormFile("file")
@@ -726,6 +828,20 @@ func rawCopy(src io.Reader, dest string) error {
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
+var (
+	logWriter   *os.File
+	logWriterMu sync.Mutex
+)
+
+func openLogWriter() {
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+	if err != nil {
+		log.Printf("failed to open log file: %v", err)
+		return
+	}
+	logWriter = f
+}
+
 // sanitizeLogField strips characters that would corrupt the TSV log or allow
 // log injection: newlines, carriage returns, tabs, and null bytes.
 func sanitizeLogField(s string) string {
@@ -738,12 +854,12 @@ func sanitizeLogField(s string) string {
 }
 
 func appendLog(r *http.Request, size int64, origName, stored string) {
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
-	if err != nil {
+	logWriterMu.Lock()
+	defer logWriterMu.Unlock()
+	if logWriter == nil {
 		return
 	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s\t%s\t%d\t%s\t%s\n",
+	fmt.Fprintf(logWriter, "%s\t%s\t%d\t%s\t%s\n",
 		time.Now().UTC().Format(time.RFC3339),
 		clientIP(r), size, sanitizeLogField(origName), stored)
 }
@@ -752,23 +868,13 @@ func appendLog(r *http.Request, size int64, origName, stored string) {
 
 // purgeDecay removes files whose age exceeds the decay-formula retention period.
 func purgeDecay() int {
-	entries, err := os.ReadDir(storePath)
-	if err != nil {
-		return 0
-	}
+	files := readStoreFiles()
 	n := 0
 	now := time.Now()
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		age := now.Sub(info.ModTime()).Hours() / 24
-		if age > retentionDays(info.Size()) {
-			os.Remove(filepath.Join(storePath, e.Name()))
+	for _, f := range files {
+		age := now.Sub(f.mtime).Hours() / 24
+		if age > retentionDays(f.size) {
+			os.Remove(filepath.Join(storePath, f.name))
 			n++
 		}
 	}
@@ -777,24 +883,14 @@ func purgeDecay() int {
 
 // purgeOlderThan removes files older than the given number of days.
 func purgeOlderThan(days int) (int, int64) {
-	entries, err := os.ReadDir(storePath)
-	if err != nil {
-		return 0, 0
-	}
+	files := readStoreFiles()
 	var count int
 	var freed int64
 	now := time.Now()
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if now.Sub(info.ModTime()).Hours()/24 > float64(days) {
-			freed += info.Size()
-			os.Remove(filepath.Join(storePath, e.Name()))
+	for _, f := range files {
+		if now.Sub(f.mtime).Hours()/24 > float64(days) {
+			freed += f.size
+			os.Remove(filepath.Join(storePath, f.name))
 			count++
 		}
 	}
@@ -823,25 +919,7 @@ func diskUsagePct() (float64, error) {
 
 // evictOldest deletes oldest files until disk usage drops below diskLowWatermark.
 func evictOldest() int {
-	entries, err := os.ReadDir(storePath)
-	if err != nil {
-		return 0
-	}
-	type fi struct {
-		name  string
-		mtime time.Time
-	}
-	var files []fi
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, fi{e.Name(), info.ModTime()})
-	}
+	files := readStoreFiles()
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].mtime.Before(files[j].mtime)
 	})
@@ -909,7 +987,7 @@ func handleFiles(w http.ResponseWriter, r *http.Request) {
 
 // ── Admin panel ───────────────────────────────────────────────────────────────
 
-type fileRow struct {
+type adminFileRow struct {
 	Name, Size, Age, ExpiresIn string
 }
 
@@ -921,7 +999,7 @@ type adminData struct {
 	LoggedIn   bool
 	Flash      string
 	ErrMsg     string
-	Files      []fileRow
+	Files      []adminFileRow
 	TotalCount int
 	TotalSize  string
 	Log        string
@@ -930,6 +1008,7 @@ type adminData struct {
 	Extensions []string
 	Tokens     []adminTokenRow
 	NewToken   string // shown once after generation
+	CSRF       string // per-session CSRF token for forms
 }
 
 var adminTpl = template.Must(template.New("admin").Parse(`<!doctype html>
@@ -963,6 +1042,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   <td>{{.Age}}</td>
   <td>{{.ExpiresIn}}</td>
   <td><form method="POST" action="/admin" onsubmit="return confirm('Delete {{.Name}}?')">
+    <input type="hidden" name="csrf" value="{{$.CSRF}}">
     <input type="hidden" name="action" value="delete">
     <input type="hidden" name="file" value="{{.Name}}">
     <button class="danger">del</button>
@@ -971,6 +1051,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 </table>
 <hr>
 <form method="POST" action="/admin">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
   <input type="hidden" name="action" value="purge">
   Delete files older than
   <input type="number" name="days" value="{{.MaxAge}}" min="1" max="9999" style="width:4em"> days
@@ -980,18 +1061,21 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 <p style="color:#555;margin-bottom:.5em">&mdash; file extensions &mdash;</p>
 <div style="margin-bottom:.5em">
 {{range .Extensions}}<form method="POST" action="/admin" style="display:inline-block;margin:0 6px 4px 0">
+  <input type="hidden" name="csrf" value="{{$.CSRF}}">
   <input type="hidden" name="action" value="rm_ext">
   <input type="hidden" name="ext" value="{{.}}">
   <span style="background:#222;padding:2px 6px;border:1px solid #444;border-radius:3px">{{.}} <button style="border:none;background:none;color:#f55;cursor:pointer;padding:0 2px">&times;</button></span>
 </form>{{end}}
 </div>
 <form method="POST" action="/admin" style="margin-bottom:1em">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
   <input type="hidden" name="action" value="add_ext">
   <input type="text" name="ext" placeholder="ext" maxlength="7" style="width:6em">
   <button>add</button>
 </form>
 <hr>
 <form method="POST" action="/admin">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
   <input type="hidden" name="action" value="viewlog">
   <button>view log</button>
 </form>
@@ -1007,6 +1091,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   <td>{{.Created}}</td>
   <td><a href="/?sharex&token={{.ID}}">sharex</a> &middot; <a href="/?hupl&token={{.ID}}">hupl</a></td>
   <td><form method="POST" action="/admin" onsubmit="return confirm('Revoke token {{.Name}}?')">
+    <input type="hidden" name="csrf" value="{{$.CSRF}}">
     <input type="hidden" name="action" value="revoke_token">
     <input type="hidden" name="token_id" value="{{.ID}}">
     <button class="danger">revoke</button>
@@ -1015,6 +1100,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 </table>
 {{else}}<p class="dim">No app tokens yet. Generate one to use instead of the master upload token.</p>{{end}}
 <form method="POST" action="/admin" style="margin:.5em 0 1em">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
   <input type="hidden" name="action" value="gen_token">
   <input type="text" name="token_name" placeholder="label (e.g. ShareX laptop)" maxlength="32" style="width:20em">
   <button>generate</button>
@@ -1022,6 +1108,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 {{if not .Tokens}}<p><a href="/?sharex">download ShareX config</a> &nbsp;&middot;&nbsp; <a href="/?hupl">download Hupl config</a></p>{{end}}
 <hr>
 <form method="POST" action="/admin">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
   <input type="hidden" name="action" value="logout">
   <button>logout</button>
 </form>
@@ -1044,12 +1131,6 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 		}
 		action := r.FormValue("action")
 
-		if action == "logout" {
-			destroySession(r)
-			http.Redirect(w, r, "/admin", http.StatusSeeOther)
-			return
-		}
-
 		if !isAdmin(r) {
 			ip := clientIP(r)
 			if !checkLoginRateLimit(ip) {
@@ -1057,8 +1138,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			pw := r.FormValue("password")
-			adminPW := os.Getenv("ADMIN_PASSWORD")
-			if adminPW == "" || !secureEqual(pw, adminPW) {
+			if cfgAdminPassword == "" || !secureEqual(pw, cfgAdminPassword) {
 				recordLoginFail(ip)
 				data.ErrMsg = "Wrong password"
 				adminTpl.Execute(w, data)
@@ -1079,7 +1159,20 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// All authenticated actions require a valid CSRF token.
+		if !validCSRF(r) {
+			plainErr(w, http.StatusForbidden, "Invalid or missing CSRF token")
+			return
+		}
+
+		if action == "logout" {
+			destroySession(r)
+			http.Redirect(w, r, "/admin", http.StatusSeeOther)
+			return
+		}
+
 		data.LoggedIn = true
+		data.CSRF = csrfToken(r)
 		switch action {
 		case "delete":
 			name := r.FormValue("file")
@@ -1145,6 +1238,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 	if isAdmin(r) {
 		data.LoggedIn = true
+		data.CSRF = csrfToken(r)
 		data.Extensions = getAllowedExts()
 		data.Tokens = adminTokenRows()
 		data.Files, data.TotalCount, data.TotalSize = listFiles()
@@ -1152,35 +1246,16 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 	adminTpl.Execute(w, data)
 }
 
-func listFiles() ([]fileRow, int, string) {
-	entries, err := os.ReadDir(storePath)
-	if err != nil {
-		return nil, 0, "0 B"
-	}
-
-	type fi struct {
-		name  string
-		size  int64
-		mtime time.Time
-	}
-	var all []fi
+func listFiles() ([]adminFileRow, int, string) {
+	all := readStoreFiles()
 	var totalSize int64
-
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		all = append(all, fi{e.Name(), info.Size(), info.ModTime()})
-		totalSize += info.Size()
+	for _, f := range all {
+		totalSize += f.size
 	}
 
 	sort.Slice(all, func(i, j int) bool { return all[i].mtime.After(all[j].mtime) })
 
-	rows := make([]fileRow, len(all))
+	rows := make([]adminFileRow, len(all))
 	now := time.Now()
 	for i, f := range all {
 		age := now.Sub(f.mtime)
@@ -1194,7 +1269,7 @@ func listFiles() ([]fileRow, int, string) {
 		default:
 			expStr = fmt.Sprintf("%.0fd", expDays)
 		}
-		rows[i] = fileRow{
+		rows[i] = adminFileRow{
 			Name:      f.name,
 			Size:      fmtSize(f.size),
 			Age:       fmtAge(age),
@@ -1339,7 +1414,7 @@ func resolveConfigToken(r *http.Request) (string, error) {
 	if hasAppTokens() {
 		return "", fmt.Errorf("app tokens exist; specify ?token=<id>")
 	}
-	return os.Getenv("UPLOAD_TOKEN"), nil
+	return cfgUploadToken, nil
 }
 
 func serveShareX(w http.ResponseWriter, r *http.Request) {
@@ -1435,7 +1510,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   cfgMaxFileAgeDays,
 		HasToken: cfgRequireAuth,
 		LoggedIn: isAdmin(r),
-		Email:    env("ADMIN_EMAIL", "admin@example.com"),
+		Email:    cfgAdminEmail,
 	})
 }
 
@@ -1453,6 +1528,7 @@ func main() {
 	}
 
 	os.MkdirAll(storePath, 0755)
+	openLogWriter()
 
 	go startCleaner()
 
