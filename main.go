@@ -29,13 +29,14 @@ import (
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const (
-	decayExp  = 2
-	minIDLen  = 4
-	maxIDLen  = 24
-	maxExtLen = 7
-	storePath = "/data/files/"
-	logPath   = "/data/uploads.log"
-	filePrefix = "/f/"
+	decayExp      = 2
+	minIDLen      = 4
+	maxIDLen      = 24
+	maxExtLen     = 7
+	storePath     = "/data/files/"
+	logPath       = "/data/uploads.log"
+	extConfigPath = "/data/extensions.json"
+	filePrefix    = "/f/"
 )
 
 var (
@@ -56,13 +57,91 @@ func loadConfig() {
 	} else {
 		cfgRequireAuth = os.Getenv("UPLOAD_TOKEN") != ""
 	}
+
+	loadAllowedExts()
 }
 
-var allowedExts = map[string]bool{
-	"jpg": true, "jpeg": true, "png": true, "gif": true,
-	"webp": true, "avif": true, "heic": true,
-	"pdf":  true,
-	"txt":  true, "md": true, "csv": true, "log": true, "json": true,
+var (
+	allowedExtsMu sync.RWMutex
+	allowedExts   = map[string]bool{
+		"jpg": true, "jpeg": true, "png": true, "gif": true,
+		"webp": true, "avif": true, "heic": true,
+		"pdf":  true,
+		"txt":  true, "md": true, "csv": true, "log": true, "json": true,
+	}
+)
+
+var validExtRe = regexp.MustCompile(`^[a-z0-9]{1,7}$`)
+
+func isExtAllowed(ext string) bool {
+	allowedExtsMu.RLock()
+	defer allowedExtsMu.RUnlock()
+	return allowedExts[ext]
+}
+
+func getAllowedExts() []string {
+	allowedExtsMu.RLock()
+	defer allowedExtsMu.RUnlock()
+	out := make([]string, 0, len(allowedExts))
+	for k := range allowedExts {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func setAllowedExt(ext string) {
+	allowedExtsMu.Lock()
+	defer allowedExtsMu.Unlock()
+	allowedExts[ext] = true
+	saveAllowedExtsLocked()
+}
+
+func removeAllowedExt(ext string) {
+	allowedExtsMu.Lock()
+	defer allowedExtsMu.Unlock()
+	delete(allowedExts, ext)
+	saveAllowedExtsLocked()
+}
+
+// saveAllowedExtsLocked writes current allowedExts to disk. Caller must hold allowedExtsMu.
+func saveAllowedExtsLocked() {
+	exts := make([]string, 0, len(allowedExts))
+	for k := range allowedExts {
+		exts = append(exts, k)
+	}
+	sort.Strings(exts)
+	data, err := json.MarshalIndent(exts, "", "  ")
+	if err != nil {
+		log.Printf("failed to marshal extensions: %v", err)
+		return
+	}
+	if err := os.WriteFile(extConfigPath, data, 0644); err != nil {
+		log.Printf("failed to save extensions config: %v", err)
+	}
+}
+
+// loadAllowedExts loads extensions from disk if the config file exists.
+func loadAllowedExts() {
+	data, err := os.ReadFile(extConfigPath)
+	if err != nil {
+		return // file doesn't exist yet; keep hardcoded defaults
+	}
+	var exts []string
+	if err := json.Unmarshal(data, &exts); err != nil {
+		log.Printf("failed to parse %s: %v", extConfigPath, err)
+		return
+	}
+	m := make(map[string]bool, len(exts))
+	for _, e := range exts {
+		e = strings.ToLower(strings.TrimPrefix(e, "."))
+		if validExtRe.MatchString(e) {
+			m[e] = true
+		}
+	}
+	allowedExtsMu.Lock()
+	allowedExts = m
+	allowedExtsMu.Unlock()
 }
 
 // Formats served inline; all others force download. Only re-encoded rasters are
@@ -303,7 +382,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	needFormToken := false
-	if cfgRequireAuth {
+	if cfgRequireAuth && isAdmin(r) {
+		// Logged-in admin session — skip token auth entirely.
+	} else if cfgRequireAuth {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 			if !secureEqual(strings.TrimPrefix(auth, "Bearer "), uploadToken) {
 				plainErr(w, http.StatusUnauthorized, "Unauthorized")
@@ -354,7 +435,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ext := strings.TrimPrefix(rawExt, ".")
-	if len(ext) > maxExtLen || !allowedExts[ext] {
+	if len(ext) > maxExtLen || !isExtAllowed(ext) {
 		plainErr(w, http.StatusBadRequest, "File type not allowed")
 		return
 	}
@@ -702,6 +783,7 @@ type adminData struct {
 	Log        string
 	ShowLog    bool
 	MaxAge     int // default value for the purge-days input
+	Extensions []string
 }
 
 var adminTpl = template.Must(template.New("admin").Parse(`<!doctype html>
@@ -749,11 +831,27 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   <button onclick="return confirm('Purge old files?')">purge</button>
 </form>
 <hr>
+<p style="color:#555;margin-bottom:.5em">&mdash; file extensions &mdash;</p>
+<div style="margin-bottom:.5em">
+{{range .Extensions}}<form method="POST" action="/admin" style="display:inline-block;margin:0 6px 4px 0">
+  <input type="hidden" name="action" value="rm_ext">
+  <input type="hidden" name="ext" value="{{.}}">
+  <span style="background:#222;padding:2px 6px;border:1px solid #444;border-radius:3px">{{.}} <button style="border:none;background:none;color:#f55;cursor:pointer;padding:0 2px">&times;</button></span>
+</form>{{end}}
+</div>
+<form method="POST" action="/admin" style="margin-bottom:1em">
+  <input type="hidden" name="action" value="add_ext">
+  <input type="text" name="ext" placeholder="ext" maxlength="7" style="width:6em">
+  <button>add</button>
+</form>
+<hr>
 <form method="POST" action="/admin">
   <input type="hidden" name="action" value="viewlog">
   <button>view log</button>
 </form>
 {{if .ShowLog}}<pre>{{.Log}}</pre>{{end}}
+<hr>
+<p><a href="/?sharex">download ShareX config</a> &nbsp;&middot;&nbsp; <a href="/?hupl">download Hupl config</a></p>
 <hr>
 <form method="POST" action="/admin">
   <input type="hidden" name="action" value="logout">
@@ -803,7 +901,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 			http.SetCookie(w, &http.Cookie{
 				Name:     "drop_session",
 				Value:    tok,
-				Path:     "/admin",
+				Path:     "/",
 				HttpOnly: true,
 				Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
 				SameSite: http.SameSiteStrictMode,
@@ -832,10 +930,29 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 				count, freed := purgeOlderThan(days)
 				data.Flash = fmt.Sprintf("Purged %d files (freed %s)", count, fmtSize(freed))
 			}
+		case "add_ext":
+			ext := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(r.FormValue("ext"), ".")))
+			if !validExtRe.MatchString(ext) {
+				data.ErrMsg = "Invalid extension (1-7 alphanumeric chars)"
+			} else if isExtAllowed(ext) {
+				data.ErrMsg = "Extension already allowed"
+			} else {
+				setAllowedExt(ext)
+				data.Flash = "Added extension: " + ext
+			}
+		case "rm_ext":
+			ext := strings.ToLower(strings.TrimSpace(r.FormValue("ext")))
+			if !validExtRe.MatchString(ext) {
+				data.ErrMsg = "Invalid extension"
+			} else {
+				removeAllowedExt(ext)
+				data.Flash = "Removed extension: " + ext
+			}
 		case "viewlog":
 			data.Log = tailLog(200)
 			data.ShowLog = true
 		}
+		data.Extensions = getAllowedExts()
 		data.Files, data.TotalCount, data.TotalSize = listFiles()
 		adminTpl.Execute(w, data)
 		return
@@ -843,6 +960,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 	if isAdmin(r) {
 		data.LoggedIn = true
+		data.Extensions = getAllowedExts()
 		data.Files, data.TotalCount, data.TotalSize = listFiles()
 	}
 	adminTpl.Execute(w, data)
@@ -925,6 +1043,7 @@ type indexData struct {
 	MinAge   int
 	MaxAge   int
 	HasToken bool
+	LoggedIn bool
 	Email    string
 }
 
@@ -947,12 +1066,23 @@ h2{color:#444;font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin
 <h2>upload via curl</h2>
 <pre>
 {{- if .HasToken -}}
-# with token
+# upload
 curl -H "Authorization: Bearer TOKEN" \
      -F "file=@photo.jpg" {{.SiteURL}}
 
-{{end -}}
-# basic upload
+# pipe with extension
+echo "hello" | curl -H "Authorization: Bearer TOKEN" \
+     -F "file=@-;filename=note.txt" {{.SiteURL}}
+
+# custom id length
+curl -H "Authorization: Bearer TOKEN" \
+     -F "file=@report.pdf" -F "id_length=12" {{.SiteURL}}
+
+# ShareX / Hupl configs
+curl "{{.SiteURL}}?sharex" -o drop.sxcu
+curl "{{.SiteURL}}?hupl"   -o drop.hupl
+{{- else -}}
+# upload
 curl -F "file=@photo.jpg" {{.SiteURL}}
 
 # pipe with extension
@@ -963,11 +1093,12 @@ curl -F "file=@report.pdf" -F "id_length=12" {{.SiteURL}}
 
 # ShareX / Hupl configs
 curl "{{.SiteURL}}?sharex" -o drop.sxcu
-curl "{{.SiteURL}}?hupl"   -o drop.hupl</pre>
+curl "{{.SiteURL}}?hupl"   -o drop.hupl
+{{- end}}</pre>
 
 <h2>upload via browser</h2>
 <form id="uform" method="POST" enctype="multipart/form-data">
-{{- if .HasToken}}
+{{- if and .HasToken (not .LoggedIn)}}
   <div style="margin-bottom:.5em">
     <label>token <input type="password" name="token" id="tok"></label>
   </div>
@@ -1095,6 +1226,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		MinAge:   cfgMinFileAgeDays,
 		MaxAge:   cfgMaxFileAgeDays,
 		HasToken: cfgRequireAuth,
+		LoggedIn: isAdmin(r),
 		Email:    env("ADMIN_EMAIL", "admin@example.com"),
 	})
 }
