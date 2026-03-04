@@ -8,7 +8,9 @@
       "Bash(php:*)",
       "WebSearch",
       "Bash(go build:*)",
-      "Bash(docker run:*)"
+      "Bash(docker run:*)",
+      "Bash(git push:*)",
+      "Bash(go vet:*)"
     ]
   }
 }
