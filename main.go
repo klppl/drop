@@ -168,10 +168,13 @@ func loadAllowedExts() {
 // ── App tokens ────────────────────────────────────────────────────────────────
 
 type appToken struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Token   string `json:"token"`
-	Created string `json:"created"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Token      string `json:"token"`
+	Created    string `json:"created"`
+	Uploads    int    `json:"uploads"`
+	TotalBytes int64  `json:"total_bytes"`
+	LastUsed   string `json:"last_used,omitempty"`
 }
 
 var (
@@ -200,15 +203,29 @@ func hasAppTokens() bool {
 	return len(appTokens) > 0
 }
 
-func isValidAppToken(token string) bool {
+func isValidAppToken(token string) (string, bool) {
 	appTokensMu.RLock()
 	defer appTokensMu.RUnlock()
 	for _, t := range appTokens {
 		if secureEqual(token, t.Token) {
-			return true
+			return t.ID, true
 		}
 	}
-	return false
+	return "", false
+}
+
+func recordAppTokenUsage(id string, size int64) {
+	appTokensMu.Lock()
+	defer appTokensMu.Unlock()
+	for i := range appTokens {
+		if appTokens[i].ID == id {
+			appTokens[i].Uploads++
+			appTokens[i].TotalBytes += size
+			appTokens[i].LastUsed = time.Now().UTC().Format(time.RFC3339)
+			saveAppTokensLocked()
+			return
+		}
+	}
 }
 
 func getAppTokens() []appToken {
@@ -265,7 +282,20 @@ func adminTokenRows() []adminTokenRow {
 		if ts, err := time.Parse(time.RFC3339, t.Created); err == nil {
 			created = ts.Format("2006-01-02")
 		}
-		rows[i] = adminTokenRow{ID: t.ID, Name: t.Name, Created: created}
+		lastUsed := "never"
+		if t.LastUsed != "" {
+			if ts, err := time.Parse(time.RFC3339, t.LastUsed); err == nil {
+				lastUsed = fmtAge(time.Since(ts)) + " ago"
+			}
+		}
+		rows[i] = adminTokenRow{
+			ID:        t.ID,
+			Name:      t.Name,
+			Created:   created,
+			Uploads:   strconv.Itoa(t.Uploads),
+			TotalSize: fmtSize(t.TotalBytes),
+			LastUsed:  lastUsed,
+		}
 	}
 	return rows
 }
@@ -598,11 +628,12 @@ func secureEqual(a, b string) bool {
 }
 
 // validateUploadToken checks a token against app tokens (if any) or the master upload token.
-func validateUploadToken(tok string) bool {
+// Returns the app token ID (empty for master token) and whether the token is valid.
+func validateUploadToken(tok string) (string, bool) {
 	if hasAppTokens() {
 		return isValidAppToken(tok)
 	}
-	return secureEqual(tok, cfgUploadToken)
+	return "", secureEqual(tok, cfgUploadToken)
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
@@ -618,19 +649,24 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	needFormToken := false
+	var usedTokenID string // app token ID used for this upload (for tracking)
 	if cfgRequireAuth && isAdmin(r) {
 		// Logged-in admin session — skip token auth entirely.
 	} else if cfgRequireAuth {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			if !validateUploadToken(strings.TrimPrefix(auth, "Bearer ")) {
+			id, ok := validateUploadToken(strings.TrimPrefix(auth, "Bearer "))
+			if !ok {
 				plainErr(w, http.StatusUnauthorized, "Unauthorized")
 				return
 			}
+			usedTokenID = id
 		} else if h := r.Header.Get("X-Upload-Token"); h != "" {
-			if !validateUploadToken(h) {
+			id, ok := validateUploadToken(h)
+			if !ok {
 				plainErr(w, http.StatusUnauthorized, "Unauthorized")
 				return
 			}
+			usedTokenID = id
 		} else {
 			needFormToken = true
 		}
@@ -642,9 +678,13 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Browser form token check.
-	if needFormToken && !validateUploadToken(r.FormValue("token")) {
-		plainErr(w, http.StatusUnauthorized, "Unauthorized")
-		return
+	if needFormToken {
+		id, ok := validateUploadToken(r.FormValue("token"))
+		if !ok {
+			plainErr(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
+		usedTokenID = id
 	}
 
 	// Per-IP upload rate limit.
@@ -723,6 +763,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	// Token is never logged.
 	if fi, err := os.Stat(dest); err == nil {
 		appendLog(r, fi.Size(), hdr.Filename, basename)
+		if usedTokenID != "" {
+			recordAppTokenUsage(usedTokenID, fi.Size())
+		}
 	}
 
 	url := siteURL(r) + filePrefix + basename
@@ -989,10 +1032,11 @@ func handleFiles(w http.ResponseWriter, r *http.Request) {
 
 type adminFileRow struct {
 	Name, Size, Age, ExpiresIn string
+	IsImage                    bool
 }
 
 type adminTokenRow struct {
-	ID, Name, Created string
+	ID, Name, Created, Uploads, TotalSize, LastUsed string
 }
 
 type adminData struct {
@@ -1012,7 +1056,9 @@ type adminData struct {
 }
 
 var adminTpl = template.Must(template.New("admin").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><title>drop :: admin</title><style>
+<html><head><meta charset="utf-8"><title>drop :: admin</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
+<style>
 *{box-sizing:border-box}
 body{background:#111;color:#ccc;font-family:monospace;font-size:14px;padding:2em;margin:0}
 a{color:#5af}
@@ -1028,15 +1074,31 @@ th{color:#555}
 form{display:inline}
 pre{background:#0a0a0a;padding:1em;overflow:auto;max-height:400px;font-size:12px;white-space:pre-wrap}
 hr{border:none;border-top:1px solid #222;margin:1.5em 0}
+.thumb{width:40px;height:40px;object-fit:cover;border:1px solid #333;border-radius:2px;vertical-align:middle;cursor:pointer;transition:transform .15s}
+.thumb:hover{transform:scale(3);position:relative;z-index:10}
+.sel-bar{display:none;margin:.5em 0;padding:6px 10px;background:#1a1a1a;border:1px solid #333;border-radius:3px}
+.sel-bar.active{display:block}
 </style></head><body>
 <div class="prompt">root@drop:~$ ls -lah /data/files/</div>
 {{- if .Flash}}<div class="flash">&#10003; {{.Flash}}</div>{{end}}
 {{- if .ErrMsg}}<div class="err">&#10007; {{.ErrMsg}}</div>{{end}}
 {{if .LoggedIn}}
 <p>{{.TotalCount}} files &nbsp;&middot;&nbsp; {{.TotalSize}} total</p>
+<div id="selbar" class="sel-bar">
+  <span id="selcount">0</span> selected &nbsp;
+  <button class="danger" id="delbtn">delete selected</button>
+  <button id="selbtnNone" style="margin-left:8px">deselect all</button>
+</div>
+<form id="bulkform" method="POST" action="/admin" style="display:none">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="action" value="delete_bulk">
+  <div id="bulkfiles"></div>
+</form>
 <table>
-<tr><th>filename</th><th>size</th><th>age</th><th>expires in</th><th></th></tr>
+<tr><th><input type="checkbox" id="selall" title="select all"></th><th></th><th>filename</th><th>size</th><th>age</th><th>expires in</th><th></th></tr>
 {{range .Files}}<tr>
+  <td><input type="checkbox" class="fsel" data-name="{{.Name}}"></td>
+  <td>{{if .IsImage}}<img class="thumb" src="/f/{{.Name}}" alt="" loading="lazy">{{end}}</td>
   <td><a href="/f/{{.Name}}">{{.Name}}</a></td>
   <td>{{.Size}}</td>
   <td>{{.Age}}</td>
@@ -1049,6 +1111,52 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   </form></td>
 </tr>{{end}}
 </table>
+<script>
+(function(){
+  var selall = document.getElementById('selall');
+  var boxes = document.querySelectorAll('.fsel');
+  var bar = document.getElementById('selbar');
+  var cnt = document.getElementById('selcount');
+  var delbtn = document.getElementById('delbtn');
+  var selbtnNone = document.getElementById('selbtnNone');
+  var bulkform = document.getElementById('bulkform');
+  var bulkfiles = document.getElementById('bulkfiles');
+
+  function updateBar(){
+    var n = document.querySelectorAll('.fsel:checked').length;
+    cnt.textContent = n;
+    bar.className = n > 0 ? 'sel-bar active' : 'sel-bar';
+  }
+
+  selall.addEventListener('change', function(){
+    boxes.forEach(function(cb){ cb.checked = selall.checked; });
+    updateBar();
+  });
+  boxes.forEach(function(cb){
+    cb.addEventListener('change', function(){
+      if (!cb.checked) selall.checked = false;
+      updateBar();
+    });
+  });
+  selbtnNone.addEventListener('click', function(){
+    selall.checked = false;
+    boxes.forEach(function(cb){ cb.checked = false; });
+    updateBar();
+  });
+  delbtn.addEventListener('click', function(){
+    var sel = document.querySelectorAll('.fsel:checked');
+    if (sel.length === 0) return;
+    if (!confirm('Delete ' + sel.length + ' file(s)?')) return;
+    bulkfiles.innerHTML = '';
+    sel.forEach(function(cb){
+      var inp = document.createElement('input');
+      inp.type = 'hidden'; inp.name = 'files'; inp.value = cb.dataset.name;
+      bulkfiles.appendChild(inp);
+    });
+    bulkform.submit();
+  });
+})();
+</script>
 <hr>
 <form method="POST" action="/admin">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -1085,10 +1193,13 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 {{if .NewToken}}<div class="flash" style="word-break:break-all">New token: <code>{{.NewToken}}</code><br><small style="color:#555">Copy now — it won't be shown again.</small></div>{{end}}
 {{if .Tokens}}
 <table>
-<tr><th>name</th><th>created</th><th>config</th><th></th></tr>
+<tr><th>name</th><th>created</th><th>uploads</th><th>total</th><th>last used</th><th>config</th><th></th></tr>
 {{range .Tokens}}<tr>
   <td>{{.Name}}</td>
   <td>{{.Created}}</td>
+  <td>{{.Uploads}}</td>
+  <td>{{.TotalSize}}</td>
+  <td>{{.LastUsed}}</td>
   <td><a href="/?sharex&token={{.ID}}">sharex</a> &middot; <a href="/?hupl&token={{.ID}}">hupl</a></td>
   <td><form method="POST" action="/admin" onsubmit="return confirm('Revoke token {{.Name}}?')">
     <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -1183,6 +1294,22 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 			} else {
 				data.Flash = "Deleted " + name
 			}
+		case "delete_bulk":
+			names := r.Form["files"]
+			var deleted int
+			for _, name := range names {
+				if !safeBasename.MatchString(name) {
+					continue
+				}
+				if err := os.Remove(storePath + name); err == nil {
+					deleted++
+				}
+			}
+			if deleted > 0 {
+				data.Flash = fmt.Sprintf("Deleted %d file(s)", deleted)
+			} else {
+				data.ErrMsg = "No files deleted"
+			}
 		case "purge":
 			days, err := strconv.Atoi(r.FormValue("days"))
 			if err != nil || days < 1 {
@@ -1269,11 +1396,13 @@ func listFiles() ([]adminFileRow, int, string) {
 		default:
 			expStr = fmt.Sprintf("%.0fd", expDays)
 		}
+		ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(f.name)), ".")
 		rows[i] = adminFileRow{
 			Name:      f.name,
 			Size:      fmtSize(f.size),
 			Age:       fmtAge(age),
 			ExpiresIn: expStr,
+			IsImage:   inlineExts[ext],
 		}
 	}
 	return rows, len(all), fmtSize(totalSize)
@@ -1309,7 +1438,9 @@ type indexData struct {
 }
 
 var indexTpl = template.Must(template.New("index").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><title>drop</title><style>
+<html><head><meta charset="utf-8"><title>drop</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
+<style>
 *{box-sizing:border-box}
 body{background:#111;color:#ccc;font-family:monospace;font-size:14px;padding:2em;margin:0;max-width:760px}
 a{color:#5af}
@@ -1358,17 +1489,27 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 {{- end}}</pre>
 
 <h2>upload via browser</h2>
-<form id="uform" method="POST" enctype="multipart/form-data">
-{{- if and .HasToken (not .LoggedIn)}}
-  <div style="margin-bottom:.5em">
-    <label>token <input type="password" name="token" id="tok"></label>
+<div id="dropzone" style="border:2px dashed #333;padding:2em;text-align:center;margin-bottom:1em;transition:border-color .2s,background .2s">
+  <p style="margin:0 0 .5em" class="dim">drag &amp; drop file here</p>
+  <form id="uform" method="POST" enctype="multipart/form-data">
+  {{- if and .HasToken (not .LoggedIn)}}
+    <div style="margin-bottom:.5em">
+      <label>token <input type="password" name="token" id="tok"></label>
+    </div>
+  {{- end}}
+    <input type="file" name="file" id="fi">
+    <input type="hidden" name="formatted" value="true">
+    <button type="submit">upload</button>
+    <span class="dim" style="margin-left:1em">or paste image</span>
+  </form>
+</div>
+<div id="progress" style="display:none;margin-bottom:1em">
+  <div style="background:#222;border:1px solid #444;height:22px;position:relative">
+    <div id="pbar" style="background:#5af;height:100%;width:0%;transition:width .15s"></div>
+    <span id="ptxt" style="position:absolute;top:0;left:0;right:0;text-align:center;line-height:22px;font-size:12px"></span>
   </div>
-{{- end}}
-  <input type="file" name="file" id="fi">
-  <input type="hidden" name="formatted" value="true">
-  <button type="submit">upload</button>
-  <span class="dim" style="margin-left:1em">or paste image</span>
-</form>
+</div>
+<div id="result" style="display:none;margin-bottom:1em"></div>
 
 <h2>retention formula</h2>
 <pre>days = {{.MinAge}} + ({{.MaxAge}} &minus; {{.MinAge}}) &times; (1 &minus; size &divide; {{.MaxSize}} MiB)&sup2;</pre>
@@ -1382,22 +1523,101 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 </p>
 
 <script>
-document.addEventListener('paste', function(e) {
-  var cd = e.clipboardData || window.clipboardData;
-  if (!cd) return;
-  for (var i = 0; i < cd.items.length; i++) {
-    var it = cd.items[i];
-    if (it.kind === 'file') {
-      var blob = it.getAsFile();
-      if (!blob) continue;
-      var dt = new DataTransfer();
-      dt.items.add(blob);
-      document.getElementById('fi').files = dt.files;
-      document.getElementById('uform').submit();
-      return;
-    }
+(function(){
+  var dz = document.getElementById('dropzone');
+  var fi = document.getElementById('fi');
+  var form = document.getElementById('uform');
+
+  function uploadFile(file) {
+    var fd = new FormData();
+    fd.append('file', file);
+    var tok = document.getElementById('tok');
+    if (tok && tok.value) fd.append('token', tok.value);
+
+    var prog = document.getElementById('progress');
+    var pbar = document.getElementById('pbar');
+    var ptxt = document.getElementById('ptxt');
+    var res = document.getElementById('result');
+    prog.style.display = 'block';
+    res.style.display = 'none';
+    pbar.style.width = '0%';
+    ptxt.textContent = '0%';
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/');
+    xhr.upload.onprogress = function(e) {
+      if (e.lengthComputable) {
+        var pct = Math.round(e.loaded / e.total * 100);
+        pbar.style.width = pct + '%';
+        ptxt.textContent = pct + '%';
+      }
+    };
+    xhr.onload = function() {
+      pbar.style.width = '100%';
+      ptxt.textContent = '100%';
+      if (xhr.status >= 200 && xhr.status < 300) {
+        var url = xhr.responseText.trim();
+        var a = document.createElement('a');
+        a.href = url; a.textContent = url; a.style.color = '#5af';
+        res.textContent = '';
+        var ok = document.createElement('span');
+        ok.style.color = '#0d0'; ok.innerHTML = '&#10003; ';
+        res.appendChild(ok); res.appendChild(a);
+      } else {
+        res.textContent = '';
+        var fail = document.createElement('span');
+        fail.style.color = '#f55'; fail.innerHTML = '&#10007; ';
+        res.appendChild(fail);
+        res.appendChild(document.createTextNode(xhr.responseText.trim()));
+      }
+      res.style.display = 'block';
+    };
+    xhr.onerror = function() {
+      ptxt.textContent = 'failed';
+      res.innerHTML = '<span style="color:#f55">&#10007;</span> Upload failed';
+      res.style.display = 'block';
+    };
+    xhr.send(fd);
   }
-});
+
+  // Drag and drop
+  ['dragenter','dragover'].forEach(function(ev) {
+    dz.addEventListener(ev, function(e) {
+      e.preventDefault(); e.stopPropagation();
+      dz.style.borderColor = '#5af'; dz.style.background = '#1a1a2a';
+    });
+  });
+  ['dragleave','drop'].forEach(function(ev) {
+    dz.addEventListener(ev, function(e) {
+      e.preventDefault(); e.stopPropagation();
+      dz.style.borderColor = '#333'; dz.style.background = '';
+    });
+  });
+  dz.addEventListener('drop', function(e) {
+    var files = e.dataTransfer.files;
+    if (files.length > 0) uploadFile(files[0]);
+  });
+
+  // Form submit via XHR
+  form.addEventListener('submit', function(e) {
+    if (fi.files.length > 0) {
+      e.preventDefault();
+      uploadFile(fi.files[0]);
+    }
+  });
+
+  // Paste
+  document.addEventListener('paste', function(e) {
+    var cd = e.clipboardData || window.clipboardData;
+    if (!cd) return;
+    for (var i = 0; i < cd.items.length; i++) {
+      if (cd.items[i].kind === 'file') {
+        var blob = cd.items[i].getAsFile();
+        if (blob) { uploadFile(blob); return; }
+      }
+    }
+  });
+})();
 </script>
 </body></html>`))
 
@@ -1443,7 +1663,7 @@ func serveShareX(w http.ResponseWriter, r *http.Request) {
   "RequestURL": %s,
   "Body": "MultipartFormData",
   "FileFormName": "file",
-  "URL": "$json:url$"%s
+  "URL": "$response$"%s
 }`, urlJSON, headers)
 }
 
@@ -1480,6 +1700,17 @@ func withSecureHeaders(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// ── Favicon ───────────────────────────────────────────────────────────────────
+
+// 16x16 SVG favicon: a downward arrow into a tray (represents "drop"/download).
+const faviconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#111"/><path d="M8 2v7M5 7l3 3 3-3" stroke="#5af" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M3 12h10" stroke="#555" stroke-width="1.5" stroke-linecap="round"/></svg>`
+
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=604800")
+	fmt.Fprint(w, faviconSVG)
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -1535,6 +1766,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleRoot)
 	mux.HandleFunc("/f/", handleFiles)
+	mux.HandleFunc("/favicon.ico", handleFavicon)
 	mux.HandleFunc("/admin", handleAdmin)
 	mux.HandleFunc("/admin/", handleAdmin)
 
