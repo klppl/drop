@@ -1489,18 +1489,18 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 {{- end}}</pre>
 
 <h2>upload via browser</h2>
-<div id="dropzone" style="border:2px dashed #333;padding:2em 2em 1.5em;text-align:center;margin-bottom:1em;transition:border-color .2s,background .2s">
-  <p style="margin:0 0 1.2em;color:#555">drag &amp; drop file here</p>
-  <form id="uform" method="POST" enctype="multipart/form-data" style="display:inline-flex;flex-direction:column;align-items:center;gap:.8em">
+<div id="dropzone" style="border:2px dashed #333;padding:1.5em;margin-bottom:1em;transition:border-color .2s,background .2s">
+  <p style="margin:0 0 1em;color:#555">drag &amp; drop file here</p>
+  <form id="uform" method="POST" enctype="multipart/form-data">
   {{- if and .HasToken (not .LoggedIn)}}
-    <label style="display:flex;align-items:center;gap:.5em;color:#555">token <input type="password" name="token" id="tok"></label>
-  {{- end}}
-    <div style="display:flex;align-items:center;gap:.8em;flex-wrap:wrap;justify-content:center">
-      <input type="file" name="file" id="fi">
-      <input type="hidden" name="formatted" value="true">
-      <button type="submit">upload</button>
-      <span class="dim">or paste image</span>
+    <div style="margin-bottom:.8em">
+      <label style="color:#555">token <input type="password" name="token" id="tok"></label>
     </div>
+  {{- end}}
+    <input type="file" name="file" id="fi">
+    <input type="hidden" name="formatted" value="true">
+    <button type="submit" style="margin-left:.5em">upload</button>
+    <span class="dim" style="margin-left:.5em">or paste image</span>
   </form>
 </div>
 <div id="progress" style="display:none;margin-bottom:1em">
