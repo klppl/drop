@@ -1079,7 +1079,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 .sel-bar{display:none;margin:.5em 0;padding:6px 10px;background:#1a1a1a;border:1px solid #333;border-radius:3px}
 .sel-bar.active{display:block}
 </style></head><body>
-<div class="prompt">root@drop:~$ ls -lah /data/files/</div>
+<div class="prompt"><a href="/" style="color:#5af;text-decoration:none">root@drop</a>:~$ ls -lah /data/files/</div>
 {{- if .Flash}}<div class="flash">&#10003; {{.Flash}}</div>{{end}}
 {{- if .ErrMsg}}<div class="err">&#10007; {{.ErrMsg}}</div>{{end}}
 {{if .LoggedIn}}
