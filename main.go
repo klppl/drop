@@ -1491,7 +1491,7 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 <h2>upload via browser</h2>
 <div id="dropzone" style="border:2px dashed #333;padding:2em;text-align:center;margin-bottom:1em;transition:border-color .2s,background .2s">
   <p style="margin:0 0 .5em" class="dim">drag &amp; drop file here</p>
-  <form id="uform" method="POST" enctype="multipart/form-data">
+  <form id="uform" method="POST" enctype="multipart/form-data" style="text-align:left">
   {{- if and .HasToken (not .LoggedIn)}}
     <div style="margin-bottom:.5em">
       <label>token <input type="password" name="token" id="tok"></label>
