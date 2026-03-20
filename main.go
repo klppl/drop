@@ -1545,6 +1545,7 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/');
+    if (tok && tok.value) xhr.setRequestHeader('X-Upload-Token', tok.value);
     xhr.upload.onprogress = function(e) {
       if (e.lengthComputable) {
         var pct = Math.round(e.loaded / e.total * 100);
@@ -1613,7 +1614,7 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
     for (var i = 0; i < cd.items.length; i++) {
       if (cd.items[i].kind === 'file') {
         var blob = cd.items[i].getAsFile();
-        if (blob) { uploadFile(blob); return; }
+        if (blob) { e.preventDefault(); uploadFile(blob); return; }
       }
     }
   });
@@ -1781,7 +1782,7 @@ func main() {
 
 		ReadHeaderTimeout: 10 * time.Second, // Slowloris defence
 		ReadTimeout:       10 * time.Minute, // must cover slow body uploads
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      10 * time.Minute, // must cover slow body uploads (same as ReadTimeout)
 		IdleTimeout:       2 * time.Minute,
 	}
 	log.Printf("drop listening on %s", port)
