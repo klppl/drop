@@ -345,6 +345,7 @@ const sessionTTL = 8 * time.Hour
 type sessionData struct {
 	expiry time.Time
 	csrf   string
+	role   string // "admin" or "upload"
 }
 
 var sessions sync.Map // token(string) → sessionData
@@ -459,11 +460,12 @@ func init() {
 	}()
 }
 
-func newSession() string {
+func newSession(role string) string {
 	tok := randHex(32)
 	sessions.Store(tok, sessionData{
 		expiry: time.Now().Add(sessionTTL),
 		csrf:   randHex(16),
+		role:   role,
 	})
 	return tok
 }
@@ -483,6 +485,24 @@ func isAdmin(r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+// isUploader returns true if the request has a valid upload or admin session.
+func isUploader(r *http.Request) bool {
+	c, err := r.Cookie("drop_session")
+	if err != nil {
+		return false
+	}
+	v, ok := sessions.Load(c.Value)
+	if !ok {
+		return false
+	}
+	sd := v.(sessionData)
+	if time.Now().After(sd.expiry) {
+		sessions.Delete(c.Value)
+		return false
+	}
+	return sd.role == "upload" || sd.role == "admin"
 }
 
 // csrfToken returns the CSRF token for the current session, or empty string.
@@ -679,8 +699,12 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Browser form token check.
 	if needFormToken {
-		id, ok := validateUploadToken(r.FormValue("token"))
+		formTok := r.FormValue("token")
+		id, ok := validateUploadToken(formTok)
 		if !ok {
+			log.Printf("upload auth failed: needFormToken=true tokenPresent=%v tokenLen=%d hasFile=%v ip=%s ua=%s",
+				formTok != "", len(formTok), r.MultipartForm != nil && len(r.MultipartForm.File["file"]) > 0,
+				clientIP(r), r.UserAgent())
 			plainErr(w, http.StatusUnauthorized, "Unauthorized")
 			return
 		}
@@ -1256,7 +1280,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			clearLoginFail(ip)
-			tok := newSession()
+			tok := newSession("admin")
 			http.SetCookie(w, &http.Cookie{
 				Name:     "drop_session",
 				Value:    tok,
