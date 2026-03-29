@@ -1458,6 +1458,7 @@ type indexData struct {
 	MaxAge   int
 	HasToken bool
 	LoggedIn bool
+	AuthErr  bool
 	Email    string
 }
 
@@ -1514,18 +1515,34 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 
 <h2>upload via browser</h2>
 <div id="dropzone" style="border:2px dashed #333;padding:1.5em;margin-bottom:1em;transition:border-color .2s,background .2s">
+{{- if and .HasToken (not .LoggedIn)}}
+  <form method="POST" style="margin-bottom:1em">
+    <input type="hidden" name="action" value="login">
+    <label style="color:#555">token <input type="password" name="token" id="tok" style="width:220px"></label>
+    <button type="submit" style="margin-left:.5em">login</button>
+    {{- if .AuthErr}}
+    <span style="color:#f55;margin-left:.5em">invalid token</span>
+    {{- end}}
+  </form>
+  <p class="dim" style="margin:0">log in to upload files</p>
+{{- else}}
+  {{- if and .HasToken .LoggedIn}}
+  <div style="margin-bottom:1em">
+    <span style="color:#0d0">&#10003;</span> <span class="dim">authenticated</span>
+    <form method="POST" style="display:inline;margin-left:1em">
+      <input type="hidden" name="action" value="logout">
+      <button type="submit" style="border:none;background:none;color:#555;cursor:pointer;font-family:monospace;padding:0;text-decoration:underline">logout</button>
+    </form>
+  </div>
+  {{- end}}
   <p style="margin:0 0 1em;color:#555">drag &amp; drop file here</p>
   <form id="uform" method="POST" enctype="multipart/form-data">
-  {{- if and .HasToken (not .LoggedIn)}}
-    <div style="margin-bottom:.8em">
-      <label style="color:#555">token <input type="password" name="token" id="tok"></label>
-    </div>
-  {{- end}}
     <input type="file" name="file" id="fi">
     <input type="hidden" name="formatted" value="true">
     <button type="submit" style="margin-left:.5em">upload</button>
     <span class="dim" style="margin-left:.5em">or paste image</span>
   </form>
+{{- end}}
 </div>
 <div id="progress" style="display:none;margin-bottom:1em">
   <div style="background:#222;border:1px solid #444;height:22px;position:relative">
@@ -1555,8 +1572,6 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
   function uploadFile(file) {
     var fd = new FormData();
     fd.append('file', file);
-    var tok = document.getElementById('tok');
-    if (tok && tok.value) fd.append('token', tok.value);
 
     var prog = document.getElementById('progress');
     var pbar = document.getElementById('pbar');
@@ -1569,7 +1584,6 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/');
-    if (tok && tok.value) xhr.setRequestHeader('X-Upload-Token', tok.value);
     xhr.upload.onprogress = function(e) {
       if (e.lengthComputable) {
         var pct = Math.round(e.loaded / e.total * 100);
@@ -1802,7 +1816,8 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		MinAge:   cfgMinFileAgeDays,
 		MaxAge:   cfgMaxFileAgeDays,
 		HasToken: cfgRequireAuth,
-		LoggedIn: isAdmin(r),
+		LoggedIn: isUploader(r),
+		AuthErr:  r.URL.Query().Get("err") == "badtoken",
 		Email:    cfgAdminEmail,
 	})
 }
