@@ -1563,6 +1563,7 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
   <a href="/admin">admin panel</a>
 </p>
 
+{{- if or (not .HasToken) .LoggedIn}}
 <script>
 (function(){
   var dz = document.getElementById('dropzone');
@@ -1658,6 +1659,7 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
   });
 })();
 </script>
+{{- end}}
 </body></html>`))
 
 // ── ShareX / Hupl configs ─────────────────────────────────────────────────────
