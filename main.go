@@ -650,10 +650,13 @@ func secureEqual(a, b string) bool {
 // validateUploadToken checks a token against app tokens (if any) or the master upload token.
 // Returns the app token ID (empty for master token) and whether the token is valid.
 func validateUploadToken(tok string) (string, bool) {
-	if hasAppTokens() {
-		return isValidAppToken(tok)
+	if id, ok := isValidAppToken(tok); ok {
+		return id, true
 	}
-	return "", secureEqual(tok, cfgUploadToken)
+	if cfgUploadToken != "" && secureEqual(tok, cfgUploadToken) {
+		return "", true
+	}
+	return "", false
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
