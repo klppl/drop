@@ -670,8 +670,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	needFormToken := false
 	var usedTokenID string // app token ID used for this upload (for tracking)
-	if cfgRequireAuth && isAdmin(r) {
-		// Logged-in admin session — skip token auth entirely.
+	if cfgRequireAuth && isUploader(r) {
+		// Logged-in session (admin or upload) — skip token auth.
 	} else if cfgRequireAuth {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 			id, ok := validateUploadToken(strings.TrimPrefix(auth, "Bearer "))
@@ -1738,6 +1738,32 @@ func handleFavicon(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, faviconSVG)
 }
 
+func handleTokenLogin(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if !checkLoginRateLimit(ip) {
+		plainErr(w, http.StatusTooManyRequests, "Too many login attempts")
+		return
+	}
+	tok := r.FormValue("token")
+	if _, ok := validateUploadToken(tok); !ok {
+		recordLoginFail(ip)
+		http.Redirect(w, r, "/?err=badtoken", http.StatusSeeOther)
+		return
+	}
+	clearLoginFail(ip)
+	sess := newSession("upload")
+	http.SetCookie(w, &http.Cookie{
+		Name:     "drop_session",
+		Value:    sess,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -1755,6 +1781,17 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPost {
+		// ParseForm first to read "action" field without consuming multipart body.
+		// For multipart uploads, FormValue("action") will be empty and we fall through.
+		if r.FormValue("action") == "login" {
+			handleTokenLogin(w, r)
+			return
+		}
+		if r.FormValue("action") == "logout" {
+			destroySession(r)
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
 		handleUpload(w, r)
 		return
 	}
