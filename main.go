@@ -484,7 +484,7 @@ func isAdmin(r *http.Request) bool {
 		sessions.Delete(c.Value)
 		return false
 	}
-	return true
+	return sd.role == "admin"
 }
 
 // isUploader returns true if the request has a valid upload or admin session.
@@ -1774,7 +1774,7 @@ func handleTokenLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteLaxMode, // Lax (not Strict) so cookie survives the POST→redirect→GET flow
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
