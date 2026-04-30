@@ -1521,10 +1521,10 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 {{- if and .HasToken (not .LoggedIn)}}
   <form method="POST" style="margin-bottom:1em">
     <input type="hidden" name="action" value="login">
-    <label style="color:#555">token <input type="password" name="token" id="tok" style="width:220px"></label>
+    <label style="color:#555">upload token <input type="password" name="token" id="tok" style="width:220px"></label>
     <button type="submit" style="margin-left:.5em">login</button>
     {{- if .AuthErr}}
-    <span style="color:#f55;margin-left:.5em">invalid token</span>
+    <span style="color:#f55;margin-left:.5em">incorrect token</span>
     {{- end}}
   </form>
   <p class="dim" style="margin:0">log in to upload files</p>
