@@ -804,8 +804,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprintf(w,
-			`<!doctype html><html><head><meta charset="utf-8"><title>drop</title>`+
-				`<style>body{background:#111;color:#ccc;font-family:monospace;padding:2em}a{color:#5af}</style></head>`+
+			`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>drop</title>`+
+				`<style>body{background:#111;color:#ccc;font-family:monospace;padding:2em;margin:0}a{color:#5af;word-break:break-all}@media(max-width:600px){body{padding:1em}}</style></head>`+
 				`<body><p>Uploaded: <a href="%s">%s</a></p></body></html>`,
 			template.HTMLEscapeString(url), template.HTMLEscapeString(url))
 	}
@@ -1083,7 +1083,7 @@ type adminData struct {
 }
 
 var adminTpl = template.Must(template.New("admin").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><title>drop :: admin</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>drop :: admin</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.ico">
 <style>
 *{box-sizing:border-box}
@@ -1105,6 +1105,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 .thumb:hover{transform:scale(3);position:relative;z-index:10}
 .sel-bar{display:none;margin:.5em 0;padding:6px 10px;background:#1a1a1a;border:1px solid #333;border-radius:3px}
 .sel-bar.active{display:block}
+@media(max-width:600px){body{padding:1em;font-size:13px}.prompt{font-size:12px;word-break:break-all}.tbl-wrap{overflow-x:auto;margin:0 -1em;padding:0 1em}table{min-width:500px}input[name=days]{width:3em!important}input[name=token_name]{width:100%!important;margin-bottom:.5em}}
 </style></head><body>
 <div class="prompt"><a href="/" style="color:#5af;text-decoration:none">root@drop</a>:~$ ls -lah /data/files/</div>
 {{- if .Flash}}<div class="flash">&#10003; {{.Flash}}</div>{{end}}
@@ -1121,6 +1122,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   <input type="hidden" name="action" value="delete_bulk">
   <div id="bulkfiles"></div>
 </form>
+<div class="tbl-wrap">
 <table>
 <tr><th><input type="checkbox" id="selall" title="select all"></th><th></th><th>filename</th><th>size</th><th>age</th><th>expires in</th><th></th></tr>
 {{range .Files}}<tr>
@@ -1138,6 +1140,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   </form></td>
 </tr>{{end}}
 </table>
+</div>
 <script>
 (function(){
   var selall = document.getElementById('selall');
@@ -1219,6 +1222,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 <p style="color:#555;margin-bottom:.5em">&mdash; api tokens &mdash;</p>
 {{if .NewToken}}<div class="flash" style="word-break:break-all">New token: <code>{{.NewToken}}</code><br><small style="color:#555">Copy now — it won't be shown again.</small></div>{{end}}
 {{if .Tokens}}
+<div class="tbl-wrap">
 <table>
 <tr><th>name</th><th>created</th><th>uploads</th><th>total</th><th>last used</th><th>config</th><th></th></tr>
 {{range .Tokens}}<tr>
@@ -1236,6 +1240,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   </form></td>
 </tr>{{end}}
 </table>
+</div>
 {{else}}<p class="dim">No app tokens yet. Generate one to use instead of the master upload token.</p>{{end}}
 <form method="POST" action="/admin" style="margin:.5em 0 1em">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -1466,7 +1471,7 @@ type indexData struct {
 }
 
 var indexTpl = template.Must(template.New("index").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><title>drop</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>drop</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.ico">
 <style>
 *{box-sizing:border-box}
@@ -1479,6 +1484,7 @@ button:hover{background:#333}
 h1{color:#5af;margin:0 0 .25em;font-size:2em}
 h2{color:#444;font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin:2em 0 .5em;border-bottom:1px solid #1e1e1e;padding-bottom:.25em}
 .dim{color:#555}
+@media(max-width:600px){body{padding:1em;font-size:13px}h1{font-size:1.4em}pre{font-size:11px}#dropzone{padding:1em!important}#uform{display:flex;flex-wrap:wrap;gap:.5em}#uform input[type=file]{width:100%}#uform button{margin-left:0!important;width:100%}}
 </style></head><body>
 <h1>drop</h1>
 <p class="dim">max {{.MaxSize}} MiB &nbsp;&middot;&nbsp; files live {{.MinAge}}&ndash;{{.MaxAge}} days</p>
