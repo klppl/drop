@@ -1089,7 +1089,7 @@ var adminTpl = template.Must(template.New("admin").Parse(`<!doctype html>
 *{box-sizing:border-box}
 body{background:#111;color:#ccc;font-family:monospace;font-size:14px;padding:2em;margin:0}
 a{color:#5af}
-input,button{background:#222;color:#ccc;border:1px solid #444;padding:4px 8px;font-family:monospace}
+input,button{background:#222;color:#ccc;border:1px solid #444;padding:6px 8px;font-family:monospace}
 button{cursor:pointer}button:hover{background:#333}
 table{border-collapse:collapse;width:100%}
 th,td{text-align:left;padding:4px 12px 4px 0;border-bottom:1px solid #1a1a1a}
@@ -1105,7 +1105,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 .thumb:hover{transform:scale(3);position:relative;z-index:10}
 .sel-bar{display:none;margin:.5em 0;padding:6px 10px;background:#1a1a1a;border:1px solid #333;border-radius:3px}
 .sel-bar.active{display:block}
-@media(max-width:600px){body{padding:1em;font-size:13px}.prompt{font-size:12px;word-break:break-all}.tbl-wrap{overflow-x:auto;margin:0 -1em;padding:0 1em}table{min-width:500px}input[name=days]{width:3em!important}input[name=token_name]{width:100%!important;margin-bottom:.5em}}
+@media(max-width:600px){body{padding:1em;font-size:13px}.prompt{font-size:12px;word-break:break-all}.tbl-wrap{overflow-x:auto;margin:0 -1em;padding:0 1em}table{min-width:500px}input[name=days]{width:3em!important}input[name=token_name]{width:100%!important;margin-bottom:.5em}button{padding-top:10px;padding-bottom:10px}.tbl-wrap button{padding-top:6px;padding-bottom:6px}input[type=text],input[type=number],input[type=password]{padding-top:10px;padding-bottom:10px}}
 </style></head><body>
 <div class="prompt"><a href="/" style="color:#5af;text-decoration:none">root@drop</a>:~$ ls -lah /data/files/</div>
 {{- if .Flash}}<div class="flash">&#10003; {{.Flash}}</div>{{end}}
@@ -1478,13 +1478,13 @@ var indexTpl = template.Must(template.New("index").Parse(`<!doctype html>
 body{background:#111;color:#ccc;font-family:monospace;font-size:14px;padding:2em;margin:0;max-width:760px}
 a{color:#5af}
 pre{background:#0a0a0a;padding:1em;overflow-x:auto;border-left:3px solid #252525;margin:0}
-input[type=file],input[type=password]{background:#222;color:#ccc;border:1px solid #444;padding:4px 8px;font-family:monospace}
-button{background:#222;color:#ccc;border:1px solid #444;padding:4px 16px;font-family:monospace;cursor:pointer}
+input[type=file],input[type=password]{background:#222;color:#ccc;border:1px solid #444;padding:6px 8px;font-family:monospace}input[type=file]::file-selector-button{background:#333;color:#ccc;border:1px solid #555;padding:3px 10px;font-family:monospace;cursor:pointer}
+button{background:#222;color:#ccc;border:1px solid #444;padding:6px 16px;font-family:monospace;cursor:pointer}
 button:hover{background:#333}
 h1{color:#5af;margin:0 0 .25em;font-size:2em}
 h2{color:#444;font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin:2em 0 .5em;border-bottom:1px solid #1e1e1e;padding-bottom:.25em}
 .dim{color:#555}
-@media(max-width:600px){body{padding:1em;font-size:13px}h1{font-size:1.4em}pre{font-size:11px}#dropzone{padding:1em!important}#uform{display:flex;flex-wrap:wrap;gap:.5em}#uform input[type=file]{width:100%}#uform button{margin-left:0!important;width:100%}}
+@media(max-width:600px){body{padding:1em;font-size:13px}h1{font-size:1.4em}pre{font-size:11px}#dropzone{padding:1em!important}#uform{display:flex;flex-wrap:wrap;gap:.5em}#uform input[type=file]{width:100%}#uform button{margin-left:0!important;width:100%}#uform .dim{margin-left:0!important;display:block;margin-top:.5em}#tok{width:100%!important;margin-bottom:.5em}#dropzone form button{margin-left:0!important;display:block;margin-top:.5em;width:100%}button,input[type=file],input[type=password]{padding-top:10px!important;padding-bottom:10px!important}}
 </style></head><body>
 <h1>drop</h1>
 <p class="dim">max {{.MaxSize}} MiB &nbsp;&middot;&nbsp; files live {{.MinAge}}&ndash;{{.MaxAge}} days</p>
