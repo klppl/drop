@@ -1806,18 +1806,22 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPost {
-		// ParseForm first to read "action" field without consuming multipart body.
-		// For multipart uploads, FormValue("action") will be empty and we fall through.
-		if r.FormValue("action") == "login" {
-			handleTokenLogin(w, r)
+		// Multipart bodies go straight to handleUpload: calling FormValue here
+		// would parse the whole upload before auth and the size cap run.
+		if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/") {
+			handleUpload(w, r)
 			return
 		}
-		if r.FormValue("action") == "logout" {
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		switch r.FormValue("action") {
+		case "login":
+			handleTokenLogin(w, r)
+		case "logout":
 			destroySession(r)
 			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
+		default:
+			plainErr(w, http.StatusBadRequest, "Bad request: expected multipart/form-data upload")
 		}
-		handleUpload(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
