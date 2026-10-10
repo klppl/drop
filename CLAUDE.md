@@ -37,7 +37,7 @@ Everything lives in a single file: `main.go`. The binary runs as an HTTP server 
 - `POST /` → `handleUpload` — authenticates, validates extension + MIME, re-encodes raster images (strips EXIF), writes to `/data/files/`, logs to `/data/uploads.log`
 - `GET /f/<id>.<ext>` → `handleFiles` — serves files; only `jpg/jpeg/png/gif` are served inline, all others force download
 - `GET|POST /admin` → `handleAdmin` — session-based admin panel (list/delete files, bulk purge, view log)
-- `GET /?sharex` / `GET /?hupl` → `serveShareX` / `serveHupl` — download pre-filled uploader config files
+- `GET /?sharex` / `GET /?hupl` → `serveShareX` / `serveHupl` — download pre-filled uploader config files (token baked in only for logged-in sessions; upload sessions always get their own token)
 
 **Background goroutines:**
 - `startCleaner` (hourly): age-based purge via `purgeDecay` + disk-pressure eviction (`evictOldest`) if disk > 90%
@@ -46,7 +46,7 @@ Everything lives in a single file: `main.go`. The binary runs as an HTTP server 
 **Storage:**
 - Files: `/data/files/<randomID>.<ext>` (4–24 char alphanum IDs)
 - Log: `/data/uploads.log` (TSV: timestamp, IP, size, original name, stored name)
-- Sessions: in-memory `sync.Map` (not persistent across restarts)
+- Sessions: in-memory `sync.Map` (not persistent across restarts); upload sessions keep the token they logged in with and die when it is revoked
 
 **File retention formula:**
 ```

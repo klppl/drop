@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"image"
@@ -346,6 +347,7 @@ type sessionData struct {
 	expiry time.Time
 	csrf   string
 	role   string // "admin" or "upload"
+	token  string // upload token used to log in ("upload" role only); memory only, never logged
 }
 
 var sessions sync.Map // token(string) → sessionData
@@ -460,49 +462,67 @@ func init() {
 	}()
 }
 
-func newSession(role string) string {
+func newSession(role, token string) string {
 	tok := randHex(32)
 	sessions.Store(tok, sessionData{
 		expiry: time.Now().Add(sessionTTL),
 		csrf:   randHex(16),
 		role:   role,
+		token:  token,
 	})
 	return tok
 }
 
-func isAdmin(r *http.Request) bool {
+// currentSession returns the live session for the request, if any.
+func currentSession(r *http.Request) (sessionData, bool) {
 	c, err := r.Cookie("drop_session")
 	if err != nil {
-		return false
+		return sessionData{}, false
 	}
 	v, ok := sessions.Load(c.Value)
 	if !ok {
-		return false
+		return sessionData{}, false
 	}
 	sd := v.(sessionData)
 	if time.Now().After(sd.expiry) {
 		sessions.Delete(c.Value)
-		return false
+		return sessionData{}, false
 	}
-	return sd.role == "admin"
+	// Upload sessions live only as long as their token: revoking an app token
+	// (or rotating UPLOAD_TOKEN) also logs out browsers that used it.
+	if sd.role == "upload" {
+		if _, ok := validateUploadToken(sd.token); !ok {
+			sessions.Delete(c.Value)
+			return sessionData{}, false
+		}
+	}
+	return sd, true
+}
+
+func isAdmin(r *http.Request) bool {
+	sd, ok := currentSession(r)
+	return ok && sd.role == "admin"
 }
 
 // isUploader returns true if the request has a valid upload or admin session.
 func isUploader(r *http.Request) bool {
-	c, err := r.Cookie("drop_session")
-	if err != nil {
-		return false
+	sd, ok := currentSession(r)
+	return ok && (sd.role == "upload" || sd.role == "admin")
+}
+
+// sessionUploadToken returns the upload token to show a logged-in user, or "".
+// Upload sessions get the token they logged in with; admins get UPLOAD_TOKEN.
+func sessionUploadToken(r *http.Request) string {
+	sd, ok := currentSession(r)
+	switch {
+	case !ok:
+		return ""
+	case sd.role == "upload":
+		return sd.token
+	case sd.role == "admin":
+		return cfgUploadToken
 	}
-	v, ok := sessions.Load(c.Value)
-	if !ok {
-		return false
-	}
-	sd := v.(sessionData)
-	if time.Now().After(sd.expiry) {
-		sessions.Delete(c.Value)
-		return false
-	}
-	return sd.role == "upload" || sd.role == "admin"
+	return ""
 }
 
 // csrfToken returns the CSRF token for the current session, or empty string.
@@ -1220,7 +1240,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
 {{if .ShowLog}}<pre>{{.Log}}</pre>{{end}}
 <hr>
 <p style="color:#555;margin-bottom:.5em">&mdash; api tokens &mdash;</p>
-{{if .NewToken}}<div class="flash" style="word-break:break-all">New token: <code>{{.NewToken}}</code><br><small style="color:#555">Copy now — it won't be shown again.</small></div>{{end}}
+{{if .NewToken}}<div class="flash" style="word-break:break-all">New token: <code>{{.NewToken}}</code><br><code style="color:#ccc">export DROP_TOKEN={{.NewToken}}</code><br><small style="color:#555">Copy now — it won't be shown again.</small></div>{{end}}
 {{if .Tokens}}
 <div class="tbl-wrap">
 <table>
@@ -1288,7 +1308,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			clearLoginFail(ip)
-			tok := newSession("admin")
+			tok := newSession("admin", "")
 			http.SetCookie(w, &http.Cookie{
 				Name:     "drop_session",
 				Value:    tok,
@@ -1465,6 +1485,7 @@ type indexData struct {
 	MinAge   int
 	MaxAge   int
 	HasToken bool
+	Token    string // shown to logged-in users only
 	LoggedIn bool
 	AuthErr  bool
 	Email    string
@@ -1492,21 +1513,23 @@ h2{color:#444;font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin
 <h2>upload via curl</h2>
 <pre>
 {{- if .HasToken -}}
+# set your upload token once (add to ~/.bashrc to keep it)
+export DROP_TOKEN={{if .Token}}<span id="tokval">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span>{{else}}&lt;your upload token&gt;{{end}}
+
 # upload
-curl -H "Authorization: Bearer TOKEN" \
+curl -H "Authorization: Bearer $DROP_TOKEN" \
      -F "file=@photo.jpg" {{.SiteURL}}
 
 # pipe with extension
-echo "hello" | curl -H "Authorization: Bearer TOKEN" \
+echo "hello" | curl -H "Authorization: Bearer $DROP_TOKEN" \
      -F "file=@-;filename=note.txt" {{.SiteURL}}
 
 # custom id length
-curl -H "Authorization: Bearer TOKEN" \
+curl -H "Authorization: Bearer $DROP_TOKEN" \
      -F "file=@report.pdf" -F "id_length=12" {{.SiteURL}}
 
-# ShareX / Hupl configs
-curl "{{.SiteURL}}?sharex" -o drop.sxcu
-curl "{{.SiteURL}}?hupl"   -o drop.hupl
+# optional shell helper:  drop photo.jpg
+drop() { curl -H "Authorization: Bearer $DROP_TOKEN" -F "file=@$1" {{.SiteURL}}; }
 {{- else -}}
 # upload
 curl -F "file=@photo.jpg" {{.SiteURL}}
@@ -1521,6 +1544,43 @@ curl -F "file=@report.pdf" -F "id_length=12" {{.SiteURL}}
 curl "{{.SiteURL}}?sharex" -o drop.sxcu
 curl "{{.SiteURL}}?hupl"   -o drop.hupl
 {{- end}}</pre>
+{{- if .HasToken}}
+{{- if .Token}}
+<p id="tokbar" data-tok="{{.Token}}" style="margin:.5em 0 0">
+  <button type="button" id="tokshow">show token</button>
+  <button type="button" id="tokcopy" style="margin-left:.5em">copy export line</button>
+  <span class="dim" style="margin-left:.5em">&middot; <a href="/?sharex">ShareX config</a> &middot; <a href="/?hupl">Hupl config</a></span>
+</p>
+<script>
+(function(){
+  var bar = document.getElementById('tokbar');
+  var tok = bar.dataset.tok;
+  var val = document.getElementById('tokval');
+  var show = document.getElementById('tokshow');
+  var copy = document.getElementById('tokcopy');
+  var mask = val.textContent;
+  show.addEventListener('click', function(){
+    var hidden = val.textContent === mask;
+    val.textContent = hidden ? tok : mask;
+    show.textContent = hidden ? 'hide token' : 'show token';
+  });
+  copy.addEventListener('click', function(){
+    var line = "export DROP_TOKEN='" + tok.replace(/'/g, "'\\''") + "'";
+    function done(){ copy.textContent = 'copied'; setTimeout(function(){ copy.textContent = 'copy export line'; }, 1500); }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(line).then(done, function(){ window.prompt('Copy:', line); });
+    } else {
+      window.prompt('Copy:', line);
+    }
+  });
+})();
+</script>
+{{- else if .LoggedIn}}
+<p class="dim" style="margin:.5em 0 0">no UPLOAD_TOKEN is set &mdash; generate an app token in the <a href="/admin">admin panel</a></p>
+{{- else}}
+<p class="dim" style="margin:.5em 0 0">log in below with your upload token to reveal it here and download ShareX / Hupl configs</p>
+{{- end}}
+{{- end}}
 
 <h2>upload via browser</h2>
 <div id="dropzone" style="border:2px dashed #333;padding:1.5em;margin-bottom:1em;transition:border-color .2s,background .2s">
@@ -1673,7 +1733,20 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
 
 // ── ShareX / Hupl configs ─────────────────────────────────────────────────────
 
+// resolveConfigToken picks the token to bake into a ShareX/Hupl config.
+// Upload sessions always get their own token; admins may pick an app token by
+// ID. Anonymous callers (only allowed when auth is off) never receive a token.
 func resolveConfigToken(r *http.Request) (string, error) {
+	sd, ok := currentSession(r)
+	if ok && sd.role == "upload" {
+		return sd.token, nil
+	}
+	if !ok || sd.role != "admin" {
+		if cfgRequireAuth {
+			return "", errUnauthorized
+		}
+		return "", nil
+	}
 	if id := r.URL.Query().Get("token"); id != "" {
 		t, ok := getAppTokenByID(id)
 		if !ok {
@@ -1681,26 +1754,34 @@ func resolveConfigToken(r *http.Request) (string, error) {
 		}
 		return t.Token, nil
 	}
-	if hasAppTokens() {
+	if hasAppTokens() && cfgUploadToken == "" {
 		return "", fmt.Errorf("app tokens exist; specify ?token=<id>")
 	}
 	return cfgUploadToken, nil
 }
 
-func serveShareX(w http.ResponseWriter, r *http.Request) {
-	if cfgRequireAuth && !isAdmin(r) {
+var errUnauthorized = errors.New("Unauthorized")
+
+// writeConfigErr maps a resolveConfigToken error to an HTTP response.
+func writeConfigErr(w http.ResponseWriter, err error) {
+	if err == errUnauthorized {
 		plainErr(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
+	plainErr(w, http.StatusBadRequest, err.Error())
+}
+
+func serveShareX(w http.ResponseWriter, r *http.Request) {
 	tok, err := resolveConfigToken(r)
 	if err != nil {
-		plainErr(w, http.StatusBadRequest, err.Error())
+		writeConfigErr(w, err)
 		return
 	}
 	headers := ""
 	if tok != "" {
+		authJSON, _ := json.Marshal("Bearer " + tok)
 		headers = fmt.Sprintf(`,
-  "Headers": {"Authorization": "Bearer %s"}`, tok)
+  "Headers": {"Authorization": %s}`, authJSON)
 	}
 	urlJSON, _ := json.Marshal(siteURL(r))
 	w.Header().Set("Content-Type", "application/json")
@@ -1718,18 +1799,15 @@ func serveShareX(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveHupl(w http.ResponseWriter, r *http.Request) {
-	if cfgRequireAuth && !isAdmin(r) {
-		plainErr(w, http.StatusUnauthorized, "Unauthorized")
-		return
-	}
 	tok, err := resolveConfigToken(r)
 	if err != nil {
-		plainErr(w, http.StatusBadRequest, err.Error())
+		writeConfigErr(w, err)
 		return
 	}
 	auth := ""
 	if tok != "" {
-		auth = fmt.Sprintf(`"Authorization": "Bearer %s"`, tok)
+		authJSON, _ := json.Marshal("Bearer " + tok)
+		auth = fmt.Sprintf(`"Authorization": %s`, authJSON)
 	}
 	urlJSON, _ := json.Marshal(siteURL(r))
 	w.Header().Set("Content-Type", "application/json")
@@ -1776,7 +1854,7 @@ func handleTokenLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clearLoginFail(ip)
-	sess := newSession("upload")
+	sess := newSession("upload", tok)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "drop_session",
 		Value:    sess,
@@ -1831,6 +1909,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		MinAge:   cfgMinFileAgeDays,
 		MaxAge:   cfgMaxFileAgeDays,
 		HasToken: cfgRequireAuth,
+		Token:    sessionUploadToken(r),
 		LoggedIn: isUploader(r),
 		AuthErr:  r.URL.Query().Get("err") == "badtoken",
 		Email:    cfgAdminEmail,

@@ -146,7 +146,7 @@ services:
 curl -F "file=@photo.jpg" http://localhost
 
 # With upload token
-curl -H "Authorization: Bearer mysecrettoken" \
+curl -H "Authorization: Bearer $DROP_TOKEN" \
      -F "file=@photo.jpg" http://localhost
 
 # Pipe content (set filename to get extension right)
@@ -162,31 +162,30 @@ The response is a plain URL, e.g. `http://localhost/f/aBc1.jpg`.
 
 Visit `http://localhost` — there's an upload form and paste-to-upload (paste an image with Ctrl+V / Cmd+V).
 
-### ShareX / Hupl
+### Getting your token
 
-Download pre-filled config files from the service. When auth is enabled these endpoints require an admin session, so you must log in first and pass the session cookie manually (the cookie's `Path: /admin` means a cookie jar won't include it for `/?sharex`):
+When auth is enabled, log in on the index page with your upload token (or log in to `/admin`). The curl examples then show an `export DROP_TOKEN=…` line with your token (hidden until you click **show token**), a **copy export line** button, and download links for ShareX and Hupl configs with your token already filled in.
 
 ```bash
-# 1. Log in and capture the session token
-SESSION=$(curl -si -X POST http://localhost/admin \
-  -d "password=YOUR_ADMIN_PASSWORD" \
-  | grep -i 'set-cookie:' \
-  | grep -o 'drop_session=[^;]*' \
-  | cut -d= -f2)
+export DROP_TOKEN='your-token'   # once, or put it in ~/.bashrc
+curl -H "Authorization: Bearer $DROP_TOKEN" -F "file=@photo.jpg" http://localhost
 
-# 2. Download the config files
-curl -b "drop_session=$SESSION" "http://localhost?sharex" -o drop.sxcu
-curl -b "drop_session=$SESSION" "http://localhost?hupl"   -o drop.hupl
+# optional helper: drop photo.jpg
+drop() { curl -H "Authorization: Bearer $DROP_TOKEN" -F "file=@$1" http://localhost; }
 ```
 
-If auth is disabled (`REQUIRE_AUTH=false` / no `UPLOAD_TOKEN` set), the plain unauthenticated form works:
+Upload-token logins see the token they logged in with. Admins see `UPLOAD_TOKEN`, and the admin panel's **api tokens** section generates per-device tokens with their own config links. Revoking an app token also ends any browser session that logged in with it.
+
+### ShareX / Hupl
+
+When auth is enabled, use the **ShareX config** / **Hupl config** links on the index page after logging in, or the per-token links in the admin panel. The config already contains your token, so you can import it directly.
+
+If auth is disabled (`REQUIRE_AUTH=false` / no `UPLOAD_TOKEN` set), the configs are public and contain no token:
 
 ```bash
 curl "http://localhost?sharex" -o drop.sxcu
 curl "http://localhost?hupl"   -o drop.hupl
 ```
-
-The downloaded configs already contain the upload token (baked in by the server), so you can import them directly into ShareX or Hupl without further configuration.
 
 ---
 
