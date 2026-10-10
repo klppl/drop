@@ -15,6 +15,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,12 +35,24 @@ const (
 	minIDLen        = 4
 	maxIDLen        = 24
 	maxExtLen       = 7
-	storePath       = "/data/files/"
-	logPath         = "/data/uploads.log"
-	extConfigPath   = "/data/extensions.json"
-	tokenConfigPath = "/data/tokens.json"
 	filePrefix      = "/f/"
 )
+
+// Storage paths, derived from DATA_DIR (default /data) by setDataDir.
+var (
+	storePath       string // uploaded files, with trailing slash
+	logPath         string
+	extConfigPath   string
+	tokenConfigPath string
+)
+
+func setDataDir(dir string) {
+	dir = strings.TrimRight(dir, "/")
+	storePath = dir + "/files/"
+	logPath = dir + "/uploads.log"
+	extConfigPath = dir + "/extensions.json"
+	tokenConfigPath = dir + "/tokens.json"
+}
 
 var (
 	cfgMaxFilesizeMiB int    // MAX_FILESIZE (MiB)
@@ -49,15 +62,23 @@ var (
 	cfgUploadToken    string // UPLOAD_TOKEN
 	cfgAdminPassword  string // ADMIN_PASSWORD
 	cfgAdminEmail     string // ADMIN_EMAIL
+	cfgUploadRate     int    // UPLOAD_RATE_LIMIT: anonymous uploads per IP per hour; 0 = unlimited
 )
 
 func loadConfig() {
+	setDataDir(env("DATA_DIR", "/data"))
 	cfgMaxFilesizeMiB = envInt("MAX_FILESIZE", 256)
 	cfgMaxFileAgeDays = envInt("MAX_FILE_AGE", 30)
 	cfgMinFileAgeDays = envInt("MIN_FILE_AGE", 3)
 	cfgUploadToken = os.Getenv("UPLOAD_TOKEN")
 	cfgAdminPassword = env("ADMIN_PASSWORD", "changeme")
 	cfgAdminEmail = env("ADMIN_EMAIL", "admin@example.com")
+	cfgUploadRate = 60
+	if v := os.Getenv("UPLOAD_RATE_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfgUploadRate = n
+		}
+	}
 
 	// Defaults to true when UPLOAD_TOKEN is set; REQUIRE_AUTH=false overrides.
 	if v := os.Getenv("REQUIRE_AUTH"); v != "" {
@@ -83,16 +104,39 @@ func loadJSON(path string, dest any) bool {
 	return true
 }
 
-// saveJSON writes data as indented JSON to path.
+// saveJSON writes data as indented JSON to path, atomically and owner-only
+// (tokens.json holds secrets).
 func saveJSON(path string, data any) {
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		log.Printf("failed to marshal JSON for %s: %v", path, err)
 		return
 	}
-	if err := os.WriteFile(path, b, 0644); err != nil {
+	if err := writeFileAtomic(path, b, 0600); err != nil {
 		log.Printf("failed to save %s: %v", path, err)
 	}
+}
+
+// writeFileAtomic writes to a temp file in the same directory, then renames it
+// over path so readers never see a half-written file.
+func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 var (
@@ -398,10 +442,7 @@ func clearLoginFail(ip string) {
 
 // ── Upload rate limiting ──────────────────────────────────────────────────────
 
-const (
-	maxUploadsPerHour = 60
-	uploadRateWindow  = time.Hour
-)
+const uploadRateWindow = time.Hour
 
 type uploadCounter struct {
 	count int
@@ -415,6 +456,9 @@ var (
 
 // checkUploadRateLimit returns true if the IP has uploads remaining in the current window.
 func checkUploadRateLimit(ip string) bool {
+	if cfgUploadRate == 0 {
+		return true
+	}
 	uploadRateMu.Lock()
 	defer uploadRateMu.Unlock()
 	c := uploadRates[ip]
@@ -424,7 +468,7 @@ func checkUploadRateLimit(ip string) bool {
 		uploadRates[ip] = uploadCounter{count: 1, reset: now.Add(uploadRateWindow)}
 		return true
 	}
-	if c.count >= maxUploadsPerHour {
+	if c.count >= cfgUploadRate {
 		return false
 	}
 	c.count++
@@ -554,12 +598,21 @@ func destroySession(r *http.Request) {
 
 const idAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
+// randID returns n random characters from idAlphabet. Bytes >= 248 are
+// rejected so every character is equally likely (256 % 62 != 0).
 func randID(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	out := make([]byte, n)
-	for i, v := range b {
-		out[i] = idAlphabet[int(v)%len(idAlphabet)]
+	const limit = 256 - 256%len(idAlphabet)
+	out := make([]byte, 0, n)
+	buf := make([]byte, n+8)
+	for len(out) < n {
+		if _, err := rand.Read(buf); err != nil {
+			panic(err)
+		}
+		for _, v := range buf {
+			if int(v) < limit && len(out) < n {
+				out = append(out, idAlphabet[int(v)%len(idAlphabet)])
+			}
+		}
 	}
 	return string(out)
 }
@@ -645,6 +698,10 @@ func clientIP(r *http.Request) string {
 	// X-Real-IP is set by nginx from $remote_addr; X-Forwarded-For is client-controlled.
 	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
 		return realIP
+	}
+	// RemoteAddr is "ip:port"; drop the port so rate limits key on the client.
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
 	}
 	return r.RemoteAddr
 }
@@ -734,10 +791,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		usedTokenID = id
 	}
 
-	// Per-IP upload rate limit.
-	if !checkUploadRateLimit(clientIP(r)) {
+	// Per-IP rate limit for anonymous uploads only; token holders and
+	// logged-in users are trusted (revoke the token to stop abuse).
+	if !cfgRequireAuth && !checkUploadRateLimit(clientIP(r)) {
 		plainErr(w, http.StatusTooManyRequests,
-			fmt.Sprintf("Upload rate limit exceeded (%d/hour)", maxUploadsPerHour))
+			fmt.Sprintf("Upload rate limit exceeded (%d/hour)", cfgUploadRate))
 		return
 	}
 
@@ -791,21 +849,30 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 			idLen = n
 		}
 	}
-	basename := randID(idLen) + "." + ext
-	if !safeBasename.MatchString(basename) {
-		plainErr(w, http.StatusInternalServerError, "Internal error")
+	out, basename, err := createUnique(idLen, ext)
+	if err != nil {
+		log.Printf("upload create error: %v", err)
+		plainErr(w, http.StatusInternalServerError, "Could not save file")
 		return
 	}
 	dest := storePath + basename
 
 	// Re-encode JPEG/PNG/GIF to strip EXIF; raw copy for all others.
-	if err := writeUploaded(f, dest, ext); err != nil {
+	werr := writeUploaded(f, out, ext)
+	if cerr := out.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
 		os.Remove(dest)
-		log.Printf("upload write error: %v", err)
+		var bad badImageError
+		if errors.As(werr, &bad) {
+			plainErr(w, http.StatusBadRequest, bad.Error())
+			return
+		}
+		log.Printf("upload write error: %v", werr)
 		plainErr(w, http.StatusInternalServerError, "Could not save file")
 		return
 	}
-	os.Chmod(dest, 0644)
 
 	// Token is never logged.
 	if fi, err := os.Stat(dest); err == nil {
@@ -834,86 +901,175 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 // 50 MP cap on decoded pixel area; guards against decompression-bomb DoS.
 const maxImagePixels = 50_000_000
 
+// GIF frames decode to 1 byte/pixel each, so cap the sum over all frames.
+var maxGIFTotalPixels int64 = 200_000_000
+
 // imgSem limits concurrent image re-encodes. Each 50 MP decode holds ~200 MB
 // of pixel data; without a cap, many simultaneous uploads can exhaust memory.
 var imgSem = make(chan struct{}, 4)
 
-// writeUploaded re-encodes JPEG/PNG/GIF to strip EXIF; falls back to raw copy on decode error.
-func writeUploaded(src io.ReadSeeker, dest, ext string) error {
-	// Check dimensions before full decode; image.DecodeConfig reads header only.
+// badImageError marks an upload rejected for its content (client error).
+type badImageError struct{ msg string }
+
+func (e badImageError) Error() string { return e.msg }
+
+// createUnique creates storePath/<random id>.<ext> exclusively, retrying on
+// the rare ID collision instead of overwriting someone else's file.
+func createUnique(idLen int, ext string) (*os.File, string, error) {
+	for i := 0; i < 10; i++ {
+		basename := randID(idLen) + "." + ext
+		if !safeBasename.MatchString(basename) {
+			return nil, "", fmt.Errorf("unsafe basename %q", basename)
+		}
+		f, err := os.OpenFile(storePath+basename, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err == nil {
+			return f, basename, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
+		// Short IDs fill up; grow the ID after a few collisions.
+		if i >= 2 && idLen < maxIDLen {
+			idLen++
+		}
+	}
+	return nil, "", fmt.Errorf("could not find a free file ID")
+}
+
+// writeUploaded re-encodes JPEG/PNG/GIF to strip EXIF; other types are copied
+// as-is. Images that fail to decode are rejected rather than stored raw, since
+// raw bytes would keep EXIF and are served inline.
+func writeUploaded(src io.ReadSeeker, out io.Writer, ext string) error {
 	switch ext {
 	case "jpg", "jpeg", "png", "gif":
-		cfg, _, err := image.DecodeConfig(src)
-		if err == nil && int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
-			return fmt.Errorf("image dimensions %dx%d exceed %d MP limit",
-				cfg.Width, cfg.Height, maxImagePixels/1_000_000)
-		}
-		if _, serr := src.Seek(0, io.SeekStart); serr != nil {
-			return serr
-		}
-		imgSem <- struct{}{}
-		defer func() { <-imgSem }()
+	default:
+		_, err := io.Copy(out, src)
+		return err
 	}
 
+	// Check dimensions before full decode; image.DecodeConfig reads header only.
+	cfg, _, err := image.DecodeConfig(src)
+	if err != nil {
+		return badImageError{"Could not decode image"}
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
+		return badImageError{fmt.Sprintf("Image dimensions %dx%d exceed %d MP limit",
+			cfg.Width, cfg.Height, maxImagePixels/1_000_000)}
+	}
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if ext == "gif" {
+		total, err := gifTotalPixels(src)
+		if err != nil {
+			return badImageError{"Could not decode image"}
+		}
+		if total > maxGIFTotalPixels {
+			return badImageError{fmt.Sprintf("GIF frames exceed %d MP in total",
+				maxGIFTotalPixels/1_000_000)}
+		}
+		if _, err := src.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+	}
+
+	imgSem <- struct{}{}
+	defer func() { <-imgSem }()
+
 	switch ext {
-	case "jpg", "jpeg":
-		img, err := jpeg.Decode(src)
-		if err != nil {
-			if _, serr := src.Seek(0, io.SeekStart); serr != nil {
-				return serr
-			}
-			return rawCopy(src, dest)
-		}
-		out, err := os.Create(dest)
-		if err != nil {
-			return err
-		}
-		defer out.Close()
-		return jpeg.Encode(out, img, &jpeg.Options{Quality: 92})
-
-	case "png":
-		img, err := png.Decode(src)
-		if err != nil {
-			if _, serr := src.Seek(0, io.SeekStart); serr != nil {
-				return serr
-			}
-			return rawCopy(src, dest)
-		}
-		out, err := os.Create(dest)
-		if err != nil {
-			return err
-		}
-		defer out.Close()
-		return png.Encode(out, img)
-
 	case "gif":
 		g, err := gif.DecodeAll(src)
 		if err != nil {
-			if _, serr := src.Seek(0, io.SeekStart); serr != nil {
-				return serr
-			}
-			return rawCopy(src, dest)
+			return badImageError{"Could not decode image"}
 		}
-		out, err := os.Create(dest)
-		if err != nil {
-			return err
-		}
-		defer out.Close()
 		return gif.EncodeAll(out, g)
-
-	default:
-		return rawCopy(src, dest)
+	case "png":
+		img, err := png.Decode(src)
+		if err != nil {
+			return badImageError{"Could not decode image"}
+		}
+		return png.Encode(out, img)
+	default: // jpg, jpeg
+		img, err := jpeg.Decode(src)
+		if err != nil {
+			return badImageError{"Could not decode image"}
+		}
+		return jpeg.Encode(out, img, &jpeg.Options{Quality: 92})
 	}
 }
 
-func rawCopy(src io.Reader, dest string) error {
-	out, err := os.Create(dest)
-	if err != nil {
-		return err
+// gifTotalPixels walks the GIF block structure without decoding pixel data and
+// returns the summed area of all frames, which is what gif.DecodeAll allocates.
+func gifTotalPixels(r io.Reader) (int64, error) {
+	br := bufio.NewReader(r)
+	hdr := make([]byte, 13) // signature + logical screen descriptor
+	if _, err := io.ReadFull(br, hdr); err != nil {
+		return 0, err
 	}
-	defer out.Close()
-	_, err = io.Copy(out, src)
-	return err
+	if string(hdr[:3]) != "GIF" {
+		return 0, fmt.Errorf("not a GIF")
+	}
+	if hdr[10]&0x80 != 0 { // global color table
+		if _, err := br.Discard(3 << (hdr[10]&7 + 1)); err != nil {
+			return 0, err
+		}
+	}
+	skipSubBlocks := func() error {
+		for {
+			n, err := br.ReadByte()
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return nil
+			}
+			if _, err := br.Discard(int(n)); err != nil {
+				return err
+			}
+		}
+	}
+	var total int64
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		switch b {
+		case 0x21: // extension: label byte, then sub-blocks
+			if _, err := br.ReadByte(); err != nil {
+				return 0, err
+			}
+			if err := skipSubBlocks(); err != nil {
+				return 0, err
+			}
+		case 0x2C: // image descriptor
+			d := make([]byte, 9)
+			if _, err := io.ReadFull(br, d); err != nil {
+				return 0, err
+			}
+			w := int64(d[4]) | int64(d[5])<<8
+			h := int64(d[6]) | int64(d[7])<<8
+			total += w * h
+			if total > maxGIFTotalPixels {
+				return total, nil
+			}
+			if d[8]&0x80 != 0 { // local color table
+				if _, err := br.Discard(3 << (d[8]&7 + 1)); err != nil {
+					return 0, err
+				}
+			}
+			if _, err := br.ReadByte(); err != nil { // LZW minimum code size
+				return 0, err
+			}
+			if err := skipSubBlocks(); err != nil {
+				return 0, err
+			}
+		case 0x3B: // trailer
+			return total, nil
+		default:
+			return 0, fmt.Errorf("bad GIF block 0x%02x", b)
+		}
+	}
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
