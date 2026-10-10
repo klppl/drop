@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -41,6 +42,8 @@ const (
 // Storage paths, derived from DATA_DIR (default /data) by setDataDir.
 var (
 	storePath       string // uploaded files, with trailing slash
+	metaPath        string // per-file metadata (<name>.json), with trailing slash
+	burnPath        string // burn-after-reading files being served, with trailing slash
 	logPath         string
 	extConfigPath   string
 	tokenConfigPath string
@@ -49,6 +52,8 @@ var (
 func setDataDir(dir string) {
 	dir = strings.TrimRight(dir, "/")
 	storePath = dir + "/files/"
+	metaPath = dir + "/meta/"
+	burnPath = dir + "/burn/"
 	logPath = dir + "/uploads.log"
 	extConfigPath = dir + "/extensions.json"
 	tokenConfigPath = dir + "/tokens.json"
@@ -849,6 +854,21 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 			idLen = n
 		}
 	}
+	// Optional earlier expiry and burn-after-reading; every upload gets a
+	// delete token so its uploader can remove it.
+	var meta fileMeta
+	if v := r.FormValue("expires"); v != "" {
+		d, err := parseExpiry(v)
+		if err != nil {
+			plainErr(w, http.StatusBadRequest, "Invalid expires (use e.g. 10m, 1h, 7d)")
+			return
+		}
+		meta.Expires = time.Now().Add(d).Unix()
+	}
+	meta.Burn = isTruthy(r.FormValue("burn"))
+	deleteToken := randHex(16)
+	meta.DeleteHash = hashToken(deleteToken)
+
 	out, basename, err := createUnique(idLen, ext)
 	if err != nil {
 		log.Printf("upload create error: %v", err)
@@ -874,13 +894,23 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := saveMeta(basename, meta); err != nil {
+		removeStored(basename)
+		log.Printf("upload meta error: %v", err)
+		plainErr(w, http.StatusInternalServerError, "Could not save file")
+		return
+	}
+
 	// Token is never logged.
 	if fi, err := os.Stat(dest); err == nil {
 		appendLog(r, fi.Size(), hdr.Filename, basename)
 		if usedTokenID != "" {
 			recordAppTokenUsage(usedTokenID, fi.Size())
 		}
+		exp := expiresAt(storeFile{basename, fi.Size(), fi.ModTime()}, meta)
+		w.Header().Set("X-Expires", exp.UTC().Format(time.RFC3339))
 	}
+	w.Header().Set("X-Delete-Token", deleteToken)
 
 	url := siteURL(r) + filePrefix + basename
 	isCLI := r.FormValue("formatted") == "" &&
@@ -893,8 +923,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w,
 			`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>drop</title>`+
 				`<style>body{background:#111;color:#ccc;font-family:monospace;padding:2em;margin:0}a{color:#5af;word-break:break-all}@media(max-width:600px){body{padding:1em}}</style></head>`+
-				`<body><p>Uploaded: <a href="%s">%s</a></p></body></html>`,
-			template.HTMLEscapeString(url), template.HTMLEscapeString(url))
+				`<body><p>Uploaded: <a href="%s">%s</a></p><p style="color:#555">delete token: %s</p></body></html>`,
+			template.HTMLEscapeString(url), template.HTMLEscapeString(url), deleteToken)
 	}
 }
 
@@ -1110,6 +1140,110 @@ func appendLog(r *http.Request, size int64, origName, stored string) {
 		clientIP(r), size, sanitizeLogField(origName), stored)
 }
 
+// ── Per-file metadata ─────────────────────────────────────────────────────────
+
+// fileMeta is stored at metaPath/<name>.json next to each upload.
+type fileMeta struct {
+	DeleteHash string `json:"delete_hash,omitempty"` // sha256 of the uploader's delete token
+	Expires    int64  `json:"expires,omitempty"`     // unix seconds; 0 = retention formula only
+	Burn       bool   `json:"burn,omitempty"`        // delete after the first download
+}
+
+func metaFile(name string) string { return metaPath + name + ".json" }
+
+// loadMeta returns the file's metadata; files from before metadata existed
+// (or with a missing sidecar) get the zero value.
+func loadMeta(name string) fileMeta {
+	var m fileMeta
+	loadJSON(metaFile(name), &m)
+	return m
+}
+
+func saveMeta(name string, m fileMeta) error {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(metaFile(name), b, 0600)
+}
+
+// removeStored deletes an upload and its metadata.
+func removeStored(name string) error {
+	err := os.Remove(storePath + name)
+	os.Remove(metaFile(name))
+	return err
+}
+
+func hashToken(t string) string {
+	h := sha256.Sum256([]byte(t))
+	return hex.EncodeToString(h[:])
+}
+
+// expiresAt is when a file expires: the retention formula, or earlier if the
+// uploader asked for it.
+func expiresAt(f storeFile, m fileMeta) time.Time {
+	t := f.mtime.Add(time.Duration(retentionDays(f.size) * float64(24*time.Hour)))
+	if m.Expires > 0 {
+		if e := time.Unix(m.Expires, 0); e.Before(t) {
+			t = e
+		}
+	}
+	return t
+}
+
+// parseExpiry accepts Go durations ("10m", "1h30m") plus a "d" suffix for days.
+func parseExpiry(v string) (time.Duration, error) {
+	v = strings.TrimSpace(strings.ToLower(v))
+	var d time.Duration
+	if n, ok := strings.CutSuffix(v, "d"); ok {
+		days, err := strconv.Atoi(n)
+		if err != nil {
+			return 0, err
+		}
+		d = time.Duration(days) * 24 * time.Hour
+	} else {
+		var err error
+		if d, err = time.ParseDuration(v); err != nil {
+			return 0, err
+		}
+	}
+	if d < time.Minute || d > 3650*24*time.Hour {
+		return 0, fmt.Errorf("expiry out of range")
+	}
+	return d, nil
+}
+
+func isTruthy(v string) bool {
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// sweepMeta removes metadata whose file is gone and leftover burn files from
+// requests that died mid-download.
+func sweepMeta() {
+	if entries, err := os.ReadDir(metaPath); err == nil {
+		for _, e := range entries {
+			name, ok := strings.CutSuffix(e.Name(), ".json")
+			if !ok {
+				continue
+			}
+			if _, err := os.Stat(storePath + name); os.IsNotExist(err) {
+				os.Remove(metaPath + e.Name())
+			}
+		}
+	}
+	if entries, err := os.ReadDir(burnPath); err == nil {
+		for _, e := range entries {
+			if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > time.Hour {
+				os.Remove(burnPath + e.Name())
+			}
+		}
+	}
+}
+
 // ── Purge ─────────────────────────────────────────────────────────────────────
 
 // purgeDecay removes files whose age exceeds the decay-formula retention period.
@@ -1118,9 +1252,8 @@ func purgeDecay() int {
 	n := 0
 	now := time.Now()
 	for _, f := range files {
-		age := now.Sub(f.mtime).Hours() / 24
-		if age > retentionDays(f.size) {
-			os.Remove(filepath.Join(storePath, f.name))
+		if now.After(expiresAt(f, loadMeta(f.name))) {
+			removeStored(f.name)
 			n++
 		}
 	}
@@ -1136,7 +1269,7 @@ func purgeOlderThan(days int) (int, int64) {
 	for _, f := range files {
 		if now.Sub(f.mtime).Hours()/24 > float64(days) {
 			freed += f.size
-			os.Remove(filepath.Join(storePath, f.name))
+			removeStored(f.name)
 			count++
 		}
 	}
@@ -1175,7 +1308,7 @@ func evictOldest() int {
 		if err != nil || pct < float64(diskLowWatermark) {
 			break
 		}
-		if err := os.Remove(filepath.Join(storePath, f.name)); err == nil {
+		if err := removeStored(f.name); err == nil {
 			log.Printf("cleaner: evicted %s under disk pressure", f.name)
 			n++
 		}
@@ -1191,6 +1324,7 @@ func startCleaner() {
 		if n := purgeDecay(); n > 0 {
 			log.Printf("cleaner: purged %d age-expired files", n)
 		}
+		sweepMeta()
 		pct, err := diskUsagePct()
 		if err != nil {
 			log.Printf("cleaner: disk stat error: %v", err)
@@ -1215,6 +1349,29 @@ func handleFiles(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+	case http.MethodDelete:
+		handleDelete(w, r, name)
+		return
+	default:
+		w.Header().Set("Allow", "GET, HEAD, DELETE")
+		plainErr(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	fi, err := os.Stat(storePath + name)
+	if err != nil || !fi.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+	meta := loadMeta(name)
+	if time.Now().After(expiresAt(storeFile{name, fi.Size(), fi.ModTime()}, meta)) {
+		removeStored(name)
+		http.NotFound(w, r)
+		return
+	}
+
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'")
 	w.Header().Set("X-Frame-Options", "DENY")
@@ -1228,14 +1385,90 @@ func handleFiles(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	}
 
-	http.ServeFile(w, r, storePath+name)
+	path := storePath + name
+	if meta.Burn {
+		w.Header().Set("Cache-Control", "no-store")
+		// Admins can look without burning; HEAD never burns.
+		if r.Method == http.MethodGet && !isAdmin(r) {
+			// Rename is atomic, so exactly one request claims the file.
+			claimed := burnPath + randHex(8) + "-" + name
+			if err := os.Rename(path, claimed); err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			os.Remove(metaFile(name))
+			defer os.Remove(claimed)
+			path = claimed
+			// Always send the full body: a 206 or 304 would burn the file
+			// without delivering it.
+			for _, h := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match"} {
+				r.Header.Del(h)
+			}
+		}
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	http.ServeContent(w, r, name, fi.ModTime(), f)
+}
+
+// handleDelete lets an uploader remove their file with the delete token
+// returned in the upload's X-Delete-Token header.
+func handleDelete(w http.ResponseWriter, r *http.Request, name string) {
+	if _, err := os.Stat(storePath + name); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	tok := r.Header.Get("X-Delete-Token")
+	meta := loadMeta(name)
+	if tok == "" || meta.DeleteHash == "" || !secureEqual(hashToken(tok), meta.DeleteHash) {
+		plainErr(w, http.StatusForbidden, "Invalid delete token")
+		return
+	}
+	if err := removeStored(name); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintln(w, "Deleted")
+}
+
+// handleHealth reports whether the store directory is reachable.
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if _, err := os.Stat(storePath); err != nil {
+		plainErr(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprintln(w, "ok")
+}
+
+// runHealthcheck is the Docker HEALTHCHECK: GET /healthz on the local port.
+func runHealthcheck(port string) int {
+	c := http.Client{Timeout: 5 * time.Second}
+	resp, err := c.Get("http://127.0.0.1" + port + "/healthz")
+	if err != nil {
+		fmt.Println(err)
+		return 1
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Println("status", resp.StatusCode)
+		return 1
+	}
+	return 0
 }
 
 // ── Admin panel ───────────────────────────────────────────────────────────────
 
 type adminFileRow struct {
 	Name, Size, Age, ExpiresIn string
-	IsImage                    bool
+	IsImage, Burn              bool
 }
 
 type adminTokenRow struct {
@@ -1307,7 +1540,7 @@ hr{border:none;border-top:1px solid #222;margin:1.5em 0}
   <td><a href="/f/{{.Name}}">{{.Name}}</a></td>
   <td>{{.Size}}</td>
   <td>{{.Age}}</td>
-  <td>{{.ExpiresIn}}</td>
+  <td>{{.ExpiresIn}}{{if .Burn}} <span style="color:#fa5">burn</span>{{end}}</td>
   <td><form method="POST" action="/admin" onsubmit="return confirm('Delete {{.Name}}?')">
     <input type="hidden" name="csrf" value="{{$.CSRF}}">
     <input type="hidden" name="action" value="delete">
@@ -1497,7 +1730,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 			name := r.FormValue("file")
 			if !safeBasename.MatchString(name) {
 				data.ErrMsg = "Invalid filename"
-			} else if err := os.Remove(storePath + name); err != nil {
+			} else if err := removeStored(name); err != nil {
 				data.ErrMsg = err.Error()
 			} else {
 				data.Flash = "Deleted " + name
@@ -1509,7 +1742,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) {
 				if !safeBasename.MatchString(name) {
 					continue
 				}
-				if err := os.Remove(storePath + name); err == nil {
+				if err := removeStored(name); err == nil {
 					deleted++
 				}
 			}
@@ -1594,7 +1827,8 @@ func listFiles() ([]adminFileRow, int, string) {
 	now := time.Now()
 	for i, f := range all {
 		age := now.Sub(f.mtime)
-		expDays := retentionDays(f.size) - age.Hours()/24
+		meta := loadMeta(f.name)
+		expDays := expiresAt(f, meta).Sub(now).Hours() / 24
 		var expStr string
 		switch {
 		case expDays < 0:
@@ -1610,7 +1844,8 @@ func listFiles() ([]adminFileRow, int, string) {
 			Size:      fmtSize(f.size),
 			Age:       fmtAge(age),
 			ExpiresIn: expStr,
-			IsImage:   inlineExts[ext],
+			IsImage:   inlineExts[ext] && !meta.Burn, // a thumbnail would not burn, but keep it hidden
+			Burn:      meta.Burn,
 		}
 	}
 	return rows, len(all), fmtSize(totalSize)
@@ -1661,40 +1896,44 @@ button:hover{background:#333}
 h1{color:#5af;margin:0 0 .25em;font-size:2em}
 h2{color:#444;font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin:2em 0 .5em;border-bottom:1px solid #1e1e1e;padding-bottom:.25em}
 .dim{color:#555}
+select,textarea,input[type=text]{background:#222;color:#ccc;border:1px solid #444;padding:6px 8px;font-family:monospace}
+textarea{width:100%;margin-top:.5em;resize:vertical}
+.opts{margin-top:1em;color:#555;display:flex;flex-wrap:wrap;gap:.5em 1.5em;align-items:center}
+details{margin-top:1em}summary{color:#555;cursor:pointer}
+.flist{list-style:none;padding:0;margin:0 0 1em}.flist li{padding:4px 0;border-bottom:1px solid #1a1a1a;word-break:break-all}
+.mini{padding:2px 8px;margin-left:.5em;font-size:12px}
+.ok{color:#0d0}.bad{color:#f55}.tag{color:#fa5}
 @media(max-width:600px){body{padding:1em;font-size:13px}h1{font-size:1.4em}pre{font-size:11px}#dropzone{padding:1em!important}#uform{display:flex;flex-wrap:wrap;gap:.5em}#uform input[type=file]{width:100%}#uform button{margin-left:0!important;width:100%}#uform .dim{margin-left:0!important;display:block;margin-top:.5em}#tok{width:100%!important;margin-bottom:.5em}#dropzone form button{margin-left:0!important;display:block;margin-top:.5em;width:100%}button,input[type=file],input[type=password]{padding-top:10px!important;padding-bottom:10px!important}}
 </style></head><body>
 <h1>drop</h1>
 <p class="dim">max {{.MaxSize}} MiB &nbsp;&middot;&nbsp; files live {{.MinAge}}&ndash;{{.MaxAge}} days</p>
 
 <h2>upload via curl</h2>
+{{- $auth := ""}}{{if .HasToken}}{{$auth = "-H \"Authorization: Bearer $DROP_TOKEN\" \\\n     "}}{{end}}
 <pre>
-{{- if .HasToken -}}
-# set your upload token once (add to ~/.bashrc to keep it)
+{{- if .HasToken}}# set your upload token once (add to ~/.bashrc to keep it)
 export DROP_TOKEN={{if .Token}}<span id="tokval">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span>{{else}}&lt;your upload token&gt;{{end}}
 
+{{end -}}
 # upload
-curl -H "Authorization: Bearer $DROP_TOKEN" \
-     -F "file=@photo.jpg" {{.SiteURL}}
+curl {{$auth}}-F "file=@photo.jpg" {{.SiteURL}}
 
 # pipe with extension
-echo "hello" | curl -H "Authorization: Bearer $DROP_TOKEN" \
-     -F "file=@-;filename=note.txt" {{.SiteURL}}
+echo "hello" | curl {{$auth}}-F "file=@-;filename=note.txt" {{.SiteURL}}
 
-# custom id length
-curl -H "Authorization: Bearer $DROP_TOKEN" \
-     -F "file=@report.pdf" -F "id_length=12" {{.SiteURL}}
+# custom id length (4-24)
+curl {{$auth}}-F "file=@report.pdf" -F "id_length=12" {{.SiteURL}}
 
-# optional shell helper:  drop photo.jpg
-drop() { curl -H "Authorization: Bearer $DROP_TOKEN" -F "file=@$1" {{.SiteURL}}; }
-{{- else -}}
-# upload
-curl -F "file=@photo.jpg" {{.SiteURL}}
+# expire sooner (10m, 1h, 7d) and/or delete after the first download
+curl {{$auth}}-F "file=@secret.pdf" -F "expires=1h" -F "burn=1" {{.SiteURL}}
 
-# pipe with extension
-echo "hello" | curl -F "file=@-;filename=note.txt" {{.SiteURL}}
+# delete your upload: -i shows the X-Delete-Token response header
+curl -i {{$auth}}-F "file=@photo.jpg" {{.SiteURL}}
+curl -X DELETE -H "X-Delete-Token: &lt;token&gt;" {{.SiteURL}}/f/abcd.jpg
 
-# custom id length
-curl -F "file=@report.pdf" -F "id_length=12" {{.SiteURL}}
+# shell helper:  drop photo.jpg
+drop() { curl {{$auth}}-F "file=@$1" {{.SiteURL}}; }
+{{- if not .HasToken}}
 
 # ShareX / Hupl configs
 curl "{{.SiteURL}}?sharex" -o drop.sxcu
@@ -1760,13 +1999,27 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
     </form>
   </div>
   {{- end}}
-  <p style="margin:0 0 1em;color:#555">drag &amp; drop file here</p>
+  <p style="margin:0 0 1em;color:#555">drag &amp; drop files here</p>
   <form id="uform" method="POST" enctype="multipart/form-data">
-    <input type="file" name="file" id="fi">
+    <input type="file" name="file" id="fi" multiple>
     <input type="hidden" name="formatted" value="true">
     <button type="submit" style="margin-left:.5em">upload</button>
     <span class="dim" style="margin-left:.5em">or paste image</span>
+    <div class="opts">
+      <label>expires <select name="expires" id="exp">
+        <option value="">default</option><option>10m</option><option>1h</option><option>1d</option><option>7d</option>
+      </select></label>
+      <label><input type="checkbox" name="burn" value="1" id="burn"> delete after first download</label>
+    </div>
   </form>
+  <details id="pastebox">
+    <summary>paste text</summary>
+    <textarea id="ptext" rows="8" spellcheck="false" placeholder="text to share"></textarea>
+    <div style="margin-top:.5em">
+      <input type="text" id="pname" value="paste.txt" maxlength="64" aria-label="filename">
+      <button type="button" id="pbtn" style="margin-left:.5em">upload text</button>
+    </div>
+  </details>
 {{- end}}
 </div>
 <div id="progress" style="display:none;margin-bottom:1em">
@@ -1775,7 +2028,12 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
     <span id="ptxt" style="position:absolute;top:0;left:0;right:0;text-align:center;line-height:22px;font-size:12px"></span>
   </div>
 </div>
-<div id="result" style="display:none;margin-bottom:1em"></div>
+<ul id="results" class="flist"></ul>
+<div id="recentwrap" style="display:none">
+  <h2>recent uploads <span style="text-transform:none;letter-spacing:0">(this browser)</span></h2>
+  <ul id="recent" class="flist"></ul>
+  <button type="button" id="rclear" class="mini">forget list</button>
+</div>
 
 <h2>retention formula</h2>
 <pre>days = {{.MinAge}} + ({{.MaxAge}} &minus; {{.MinAge}}) &times; (1 &minus; size &divide; {{.MaxSize}} MiB)&sup2;</pre>
@@ -1794,19 +2052,134 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
   var dz = document.getElementById('dropzone');
   var fi = document.getElementById('fi');
   var form = document.getElementById('uform');
+  var exp = document.getElementById('exp');
+  var burn = document.getElementById('burn');
+  var prog = document.getElementById('progress');
+  var pbar = document.getElementById('pbar');
+  var ptxt = document.getElementById('ptxt');
+  var results = document.getElementById('results');
+  var recentWrap = document.getElementById('recentwrap');
+  var recent = document.getElementById('recent');
+  var RKEY = 'drop_recent';
 
-  function uploadFile(file) {
+  // ── recent uploads (localStorage, this browser only) ──
+  function loadRecent() {
+    try { return JSON.parse(localStorage.getItem(RKEY)) || []; } catch (e) { return []; }
+  }
+  function saveRecent(list) {
+    try { localStorage.setItem(RKEY, JSON.stringify(list.slice(0, 50))); } catch (e) {}
+  }
+  function liveRecent() {
+    var now = Date.now();
+    return loadRecent().filter(function(x) { return !x.exp || Date.parse(x.exp) > now; });
+  }
+  function forget(url) {
+    saveRecent(loadRecent().filter(function(x) { return x.url !== url; }));
+  }
+  function renderRecent() {
+    var list = liveRecent();
+    saveRecent(list);
+    recent.textContent = '';
+    list.forEach(function(item) { recent.appendChild(fileRow(item)); });
+    recentWrap.style.display = list.length ? 'block' : 'none';
+  }
+  document.getElementById('rclear').addEventListener('click', function() {
+    if (confirm('Forget the list? Files stay online until they expire.')) { saveRecent([]); renderRecent(); }
+  });
+
+  // ── rows ──
+  function mini(label, fn) {
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'mini'; b.textContent = label;
+    b.addEventListener('click', function() { fn(b); });
+    return b;
+  }
+  function copyText(text, b) {
+    function done() { b.textContent = 'copied'; setTimeout(function() { b.textContent = 'copy'; }, 1500); }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, function() { window.prompt('Copy:', text); });
+    } else {
+      window.prompt('Copy:', text);
+    }
+  }
+  function fmtLeft(iso) {
+    var ms = Date.parse(iso) - Date.now();
+    if (!(ms > 0)) return '';
+    var m = Math.round(ms / 60000);
+    if (m < 60) return m + 'm';
+    if (m < 2880) return Math.round(m / 60) + 'h';
+    return Math.round(m / 1440) + 'd';
+  }
+  function fileRow(item) {
+    var li = document.createElement('li');
+    var ok = document.createElement('span');
+    ok.className = 'ok'; ok.textContent = '\u2713 ';
+    var a = document.createElement('a');
+    a.href = item.url; a.textContent = item.url;
+    li.appendChild(ok); li.appendChild(a);
+    var info = document.createElement('span');
+    info.className = 'dim';
+    var left = item.exp ? fmtLeft(item.exp) : '';
+    info.textContent = (item.name ? '  ' + item.name : '') + (left ? ' \u00b7 ' + left + ' left' : '');
+    li.appendChild(info);
+    if (item.burn) {
+      var t = document.createElement('span');
+      t.className = 'tag'; t.textContent = ' burn';
+      li.appendChild(t);
+    }
+    li.appendChild(mini('copy', function(b) { copyText(item.url, b); }));
+    if (item.del) {
+      li.appendChild(mini('delete', function(b) {
+        if (!confirm('Delete ' + item.url + '?')) return;
+        b.disabled = true;
+        fetch(item.url, { method: 'DELETE', headers: { 'X-Delete-Token': item.del } })
+          .then(function(r) {
+            if (r.ok || r.status === 404) {
+              forget(item.url);
+              li.style.opacity = '.4'; a.removeAttribute('href'); b.textContent = 'deleted';
+              renderRecent();
+            } else {
+              return r.text().then(function(t) { b.disabled = false; alert(t.trim()); });
+            }
+          }, function() { b.disabled = false; alert('Delete failed'); });
+      }));
+    }
+    return li;
+  }
+  function errorRow(name, msg) {
+    var li = document.createElement('li');
+    var x = document.createElement('span');
+    x.className = 'bad'; x.textContent = '\u2717 ';
+    li.appendChild(x);
+    li.appendChild(document.createTextNode((name ? name + ': ' : '') + msg));
+    results.insertBefore(li, results.firstChild);
+  }
+
+  // ── uploads (one at a time) ──
+  var queue = [], busy = false;
+  // Options are captured when files are queued, not when they upload.
+  function enqueue(files) {
+    var opts = { exp: exp.value, burn: burn.checked };
+    for (var i = 0; i < files.length; i++) queue.push({ file: files[i], opts: opts });
+    next();
+  }
+  function next() {
+    if (busy || !queue.length) return;
+    busy = true;
+    var job = queue.shift();
+    uploadFile(job.file, job.opts, function() { busy = false; next(); });
+  }
+  function uploadFile(file, opts, done) {
+    var name = file.name || 'paste.png';
     var fd = new FormData();
-    fd.append('file', file);
+    fd.append('file', file, name);
+    if (opts.exp) fd.append('expires', opts.exp);
+    if (opts.burn) fd.append('burn', '1');
 
-    var prog = document.getElementById('progress');
-    var pbar = document.getElementById('pbar');
-    var ptxt = document.getElementById('ptxt');
-    var res = document.getElementById('result');
+    var label = name + (queue.length ? ' (+' + queue.length + ' queued)' : '');
     prog.style.display = 'block';
-    res.style.display = 'none';
     pbar.style.width = '0%';
-    ptxt.textContent = '0%';
+    ptxt.textContent = label + ' 0%';
 
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/');
@@ -1814,33 +2187,33 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
       if (e.lengthComputable) {
         var pct = Math.round(e.loaded / e.total * 100);
         pbar.style.width = pct + '%';
-        ptxt.textContent = pct + '%';
+        ptxt.textContent = label + ' ' + pct + '%';
       }
     };
     xhr.onload = function() {
-      pbar.style.width = '100%';
-      ptxt.textContent = '100%';
       if (xhr.status >= 200 && xhr.status < 300) {
-        var url = xhr.responseText.trim();
-        var a = document.createElement('a');
-        a.href = url; a.textContent = url; a.style.color = '#5af';
-        res.textContent = '';
-        var ok = document.createElement('span');
-        ok.style.color = '#0d0'; ok.innerHTML = '&#10003; ';
-        res.appendChild(ok); res.appendChild(a);
+        var item = {
+          url: xhr.responseText.trim(),
+          del: xhr.getResponseHeader('X-Delete-Token') || '',
+          exp: xhr.getResponseHeader('X-Expires') || '',
+          name: name,
+          burn: opts.burn
+        };
+        var list = loadRecent();
+        list.unshift(item);
+        saveRecent(list);
+        results.insertBefore(fileRow(item), results.firstChild);
+        renderRecent();
       } else {
-        res.textContent = '';
-        var fail = document.createElement('span');
-        fail.style.color = '#f55'; fail.innerHTML = '&#10007; ';
-        res.appendChild(fail);
-        res.appendChild(document.createTextNode(xhr.responseText.trim()));
+        errorRow(name, xhr.responseText.trim() || ('HTTP ' + xhr.status));
       }
-      res.style.display = 'block';
+      if (!queue.length) prog.style.display = 'none';
+      done();
     };
     xhr.onerror = function() {
-      ptxt.textContent = 'failed';
-      res.innerHTML = '<span style="color:#f55">&#10007;</span> Upload failed';
-      res.style.display = 'block';
+      errorRow(name, 'upload failed');
+      if (!queue.length) prog.style.display = 'none';
+      done();
     };
     xhr.send(fd);
   }
@@ -1859,29 +2232,41 @@ curl "{{.SiteURL}}?hupl"   -o drop.hupl
     });
   });
   dz.addEventListener('drop', function(e) {
-    var files = e.dataTransfer.files;
-    if (files.length > 0) uploadFile(files[0]);
+    if (e.dataTransfer.files.length) enqueue(e.dataTransfer.files);
   });
 
   // Form submit via XHR
   form.addEventListener('submit', function(e) {
     if (fi.files.length > 0) {
       e.preventDefault();
-      uploadFile(fi.files[0]);
+      enqueue(fi.files);
+      fi.value = '';
     }
   });
 
-  // Paste
+  // Paste image anywhere (text pastes into the textarea as usual)
   document.addEventListener('paste', function(e) {
     var cd = e.clipboardData || window.clipboardData;
     if (!cd) return;
     for (var i = 0; i < cd.items.length; i++) {
       if (cd.items[i].kind === 'file') {
         var blob = cd.items[i].getAsFile();
-        if (blob) { e.preventDefault(); uploadFile(blob); return; }
+        if (blob) { e.preventDefault(); enqueue([blob]); return; }
       }
     }
   });
+
+  // Paste text
+  document.getElementById('pbtn').addEventListener('click', function() {
+    var text = document.getElementById('ptext').value;
+    if (!text) return;
+    var name = document.getElementById('pname').value.trim() || 'paste.txt';
+    if (name.indexOf('.') < 0) name += '.txt';
+    enqueue([new File([text], name, { type: 'text/plain' })]);
+    document.getElementById('ptext').value = '';
+  });
+
+  renderRecent();
 })();
 </script>
 {{- end}}
@@ -2077,15 +2462,29 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 func main() {
 	loadConfig()
 
-	// Purge mode: invoked by cron or Docker healthcheck.
+	port := env("PORT", "8080")
+	if !strings.HasPrefix(port, ":") {
+		port = ":" + port
+	}
+
+	// Purge mode: manual or cron-driven one-off purge.
 	if len(os.Args) > 1 && os.Args[1] == "purge" {
 		os.MkdirAll(storePath, 0755)
 		n := purgeDecay()
+		sweepMeta()
 		fmt.Printf("purged %d files\n", n)
 		return
 	}
+	// Health mode: Docker HEALTHCHECK.
+	if len(os.Args) > 1 && os.Args[1] == "health" {
+		os.Exit(runHealthcheck(port))
+	}
 
-	os.MkdirAll(storePath, 0755)
+	for _, d := range []string{storePath, metaPath, burnPath} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			log.Printf("mkdir %s: %v", d, err)
+		}
+	}
 	openLogWriter()
 
 	go startCleaner()
@@ -2094,13 +2493,9 @@ func main() {
 	mux.HandleFunc("/", handleRoot)
 	mux.HandleFunc("/f/", handleFiles)
 	mux.HandleFunc("/favicon.ico", handleFavicon)
+	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/admin", handleAdmin)
 	mux.HandleFunc("/admin/", handleAdmin)
-
-	port := env("PORT", "8080")
-	if !strings.HasPrefix(port, ":") {
-		port = ":" + port
-	}
 
 	srv := &http.Server{
 		Addr:    port,

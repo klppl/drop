@@ -21,8 +21,9 @@ USER drop
 
 EXPOSE 8080
 
-# Healthcheck doubles as a periodic purge of expired files (every 12 h).
-HEALTHCHECK --interval=12h --timeout=60s --start-period=10s --retries=1 \
-    CMD ["/app/drop", "purge"]
+# Liveness check against /healthz. Expired files are purged hourly in-process;
+# run `/app/drop purge` to purge on demand.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/app/drop", "health"]
 
 CMD ["/app/drop"]
