@@ -6,9 +6,10 @@ A self-hosted file drop service. Upload files via `curl` or browser, share a sho
 
 - Zero runtime dependencies — single Go binary
 - ~12 MB Docker image, ~15 MB RAM at idle
-- Token-protected uploads, password-protected admin panel
+- Token-protected uploads (master token or per-device app tokens), password-protected admin panel
 - EXIF stripping for JPEG, PNG, GIF
-- Files expire automatically using a size-based decay formula
+- Files expire automatically using a size-based decay formula, or sooner on request
+- Delete tokens, burn-after-reading, multi-file browser uploads, text pastes
 
 ---
 
@@ -34,14 +35,16 @@ Set these in your `.env` file (copied from `.env.example`).
 
 | Variable | Default | Description |
 |---|---|---|
-| `UPLOAD_TOKEN` | *(empty)* | Token callers must supply to upload. Leave empty for open uploads. |
-| `REQUIRE_AUTH` | `true` if token is set, `false` otherwise | Explicitly enable or disable auth. Set to `false` to allow open uploads even when a token is configured (useful for temporarily disabling auth without removing the token). |
+| `UPLOAD_TOKEN` | *(empty)* | Master token callers must supply to upload. Leave empty for open uploads. App tokens generated in the admin panel work alongside it. |
+| `REQUIRE_AUTH` | `true` if token is set, `false` otherwise | Explicitly enable or disable auth. Set to `false` to allow open uploads even when a token is configured. |
+| `UPLOAD_RATE_LIMIT` | `60` | Anonymous uploads per IP per hour (only applies when auth is off). `0` = unlimited. Authenticated uploads are not rate-limited. |
 
 ### File limits
 
 | Variable | Default | Description |
 |---|---|---|
-| `MAX_FILESIZE` | `256` | Maximum upload size in **MiB**. If you raise this above 258, also update `client_max_body_size` in `nginx/default.conf` to match. |
+| `MAX_FILESIZE` | `256` | Maximum upload size in **MiB**. Also set `NGINX_MAX_BODY_MIB` to `MAX_FILESIZE + 2`. |
+| `NGINX_MAX_BODY_MIB` | `258` | nginx `client_max_body_size`; must stay in sync with `MAX_FILESIZE`. |
 
 ### Retention
 
@@ -50,13 +53,15 @@ Set these in your `.env` file (copied from `.env.example`).
 | `MAX_FILE_AGE` | `30` | Maximum days a file is kept (applies to the smallest files). |
 | `MIN_FILE_AGE` | `3` | Minimum days a file is kept (applies to max-size files). |
 
-### Admin
+### Admin and runtime
 
 | Variable | Default | Description |
 |---|---|---|
 | `ADMIN_PASSWORD` | `changeme` | Password for the `/admin` panel. **Change this before exposing publicly.** |
 | `ADMIN_EMAIL` | `admin@example.com` | Contact email shown on the index page. |
 | `TZ` | `UTC` | Timezone for log timestamps, e.g. `Europe/Amsterdam`. |
+| `PORT` | `8080` | Port the Go binary listens on. |
+| `DATA_DIR` | `/data` | Where files, metadata, tokens and the log are stored. |
 
 **`.env` example:**
 
@@ -64,6 +69,7 @@ Set these in your `.env` file (copied from `.env.example`).
 UPLOAD_TOKEN=mysecrettoken
 REQUIRE_AUTH=true
 MAX_FILESIZE=512
+NGINX_MAX_BODY_MIB=514
 MAX_FILE_AGE=14
 MIN_FILE_AGE=1
 ADMIN_PASSWORD=anothersecretpassword
@@ -91,12 +97,16 @@ services:
 #   drop_data:
 ```
 
-The container writes two things inside `/data`:
+The container writes these inside `/data`:
 
 | Path inside container | Contents |
 |---|---|
 | `/data/files/` | Uploaded files |
+| `/data/meta/` | Per-file metadata: hashed delete token, requested expiry, burn flag |
+| `/data/burn/` | Burn-after-reading files while their single download is in progress |
 | `/data/uploads.log` | Upload log (timestamp, IP, size, original name, stored name) |
+| `/data/tokens.json` | App tokens (mode 0600) |
+| `/data/extensions.json` | Allowed extensions, if changed in the admin panel |
 
 **Full bind-mount example:**
 
@@ -107,8 +117,10 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+    environment:
+      NGINX_MAX_BODY_MIB: ${NGINX_MAX_BODY_MIB:-258}
     volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/templates:/etc/nginx/templates:ro
     depends_on:
       - drop
 
@@ -117,7 +129,8 @@ services:
     restart: unless-stopped
     environment:
       UPLOAD_TOKEN:   ${UPLOAD_TOKEN:-}
-      REQUIRE_AUTH:   ${REQUIRE_AUTH:-true}
+      REQUIRE_AUTH:   ${REQUIRE_AUTH:-}
+      UPLOAD_RATE_LIMIT: ${UPLOAD_RATE_LIMIT:-60}
       MAX_FILESIZE:   ${MAX_FILESIZE:-256}
       MAX_FILE_AGE:   ${MAX_FILE_AGE:-30}
       MIN_FILE_AGE:   ${MIN_FILE_AGE:-3}
@@ -145,7 +158,7 @@ services:
 # Open instance
 curl -F "file=@photo.jpg" http://localhost
 
-# With upload token
+# With upload token (see "Getting your token" below)
 curl -H "Authorization: Bearer $DROP_TOKEN" \
      -F "file=@photo.jpg" http://localhost
 
@@ -154,13 +167,47 @@ echo "hello world" | curl -F "file=@-;filename=note.txt" http://localhost
 
 # Custom ID length (4–24 chars, default 4)
 curl -F "file=@report.pdf" -F "id_length=10" http://localhost
+
+# Expire sooner than the retention formula (10m, 1h, 7d, 1h30m, ...)
+curl -F "file=@report.pdf" -F "expires=1h" http://localhost
+
+# Burn after reading: deleted after the first download
+curl -F "file=@secret.pdf" -F "burn=1" http://localhost
 ```
 
-The response is a plain URL, e.g. `http://localhost/f/aBc1.jpg`.
+The response body is a plain URL, e.g. `http://localhost/f/aBc1.jpg`. Two response headers carry extra information:
+
+| Header | Meaning |
+|---|---|
+| `X-Delete-Token` | Secret that lets you delete this file (only shown once) |
+| `X-Expires` | When the file will be removed (RFC 3339) |
+
+Upload form fields: `file` (required), `id_length`, `expires`, `burn`, and `token` (alternative to the auth headers).
+
+### Deleting your upload
+
+Use `curl -i` to see the delete token, then:
+
+```bash
+curl -X DELETE -H "X-Delete-Token: <token>" http://localhost/f/aBc1.jpg
+```
+
+The browser page remembers delete tokens for you (see below).
+
+### Burn after reading
+
+With `burn=1` the first `GET` claims the file and deletes it once served. `HEAD` requests and views from a logged-in admin do not count. Range requests get the full file, since a partial response would burn the file without delivering it. Chat apps that unfurl links (Slack, Discord, etc.) will fetch the URL and use up the download, so share burn links where previews are off.
 
 ### Browser
 
-Visit `http://localhost` — there's an upload form and paste-to-upload (paste an image with Ctrl+V / Cmd+V).
+Visit `http://localhost`. You can:
+
+- pick or drag & drop several files (they upload one after another), or paste an image with Ctrl+V / Cmd+V
+- choose an expiry and tick **delete after first download**
+- open **paste text** to upload text as `paste.txt` (or a filename you choose)
+- copy each link, or delete the file with its stored delete token
+
+**Recent uploads** lists what this browser uploaded (kept in `localStorage`, up to 50 entries, expired ones dropped). **forget list** only clears the list; files stay online until they expire.
 
 ### Getting your token
 
@@ -196,11 +243,15 @@ curl "http://localhost?hupl"   -o drop.hupl
 Visit `http://localhost/admin` and log in with `ADMIN_PASSWORD`.
 
 Features:
-- File list with size, age, and time until expiry
-- Delete individual files
+- File list with size, age, time until expiry, and a `burn` tag for burn-after-reading files
+- Delete individual files or a selection
 - Bulk purge: delete all files older than N days
+- Add / remove allowed file extensions
+- App tokens: generate per-device upload tokens, see their usage, revoke them, and download ShareX / Hupl configs per token
 - View the last 200 lines of the upload log
 - Logout
+
+Login attempts are rate-limited to 10 failures per IP per hour.
 
 ---
 
@@ -221,7 +272,9 @@ With the defaults (`MIN_FILE_AGE=3`, `MAX_FILE_AGE=30`, `MAX_FILESIZE=256`):
 | 100 MiB | ~12 days |
 | 256 MiB | 3 days |
 
-Expired files are purged automatically every 12 hours via the Docker healthcheck. You can also trigger a purge manually:
+An uploader can ask for a shorter life with `expires`, never a longer one.
+
+Expired files are purged hourly by a background job in the server, and also on access. If disk usage goes over 90 %, the oldest files are evicted until it is below 80 %. You can also trigger a purge manually:
 
 ```bash
 docker compose exec drop /app/drop purge
@@ -237,9 +290,9 @@ docker compose exec drop /app/drop purge
 | Documents | `pdf` |
 | Text | `txt`, `md`, `csv`, `log`, `json` |
 
-SVG, HTML, and XML are intentionally excluded (XSS risk).
+These are the defaults; the admin panel can change the list. SVG, HTML, and XML are intentionally excluded (XSS risk).
 
-JPEG, PNG, and GIF uploads are re-encoded to strip EXIF metadata before storage.
+JPEG, PNG, and GIF uploads are decoded and re-encoded to strip EXIF metadata before storage; files that do not decode are rejected. Images over 50 megapixels, and GIFs whose frames add up to more than 200 megapixels, are rejected to prevent decompression bombs. Only JPEG, PNG and GIF are shown inline; everything else (including text pastes) is served as a download.
 
 ---
 
@@ -253,6 +306,22 @@ If you already have a proxy in front of the nginx container and want to skip ngi
   drop:
     ports:
       - "8080:8080"
+```
+
+---
+
+## Health check
+
+`GET /healthz` returns `ok` when the store directory is reachable. The Docker image's `HEALTHCHECK` runs `/app/drop health`, which calls it every 30 seconds.
+
+---
+
+## Development
+
+```bash
+go vet ./...
+go test -race ./...
+DATA_DIR=./data go run .   # run locally without Docker
 ```
 
 ---

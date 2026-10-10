@@ -32,11 +32,11 @@ import (
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const (
-	decayExp        = 2
-	minIDLen        = 4
-	maxIDLen        = 24
-	maxExtLen       = 7
-	filePrefix      = "/f/"
+	decayExp   = 2
+	minIDLen   = 4
+	maxIDLen   = 24
+	maxExtLen  = 7
+	filePrefix = "/f/"
 )
 
 // Storage paths, derived from DATA_DIR (default /data) by setDataDir.
@@ -149,8 +149,8 @@ var (
 	allowedExts   = map[string]bool{
 		"jpg": true, "jpeg": true, "png": true, "gif": true,
 		"webp": true, "avif": true, "heic": true,
-		"pdf":  true,
-		"txt":  true, "md": true, "csv": true, "log": true, "json": true,
+		"pdf": true,
+		"txt": true, "md": true, "csv": true, "log": true, "json": true,
 	}
 )
 
@@ -362,8 +362,8 @@ var extMIME = map[string]string{
 	"png":  "image/png",
 	"gif":  "image/gif",
 	"webp": "image/webp",
-	"avif": "",   // ISOBMFF-based; DetectContentType returns octet-stream
-	"heic": "",   // ISOBMFF-based; same issue
+	"avif": "", // ISOBMFF-based; DetectContentType returns octet-stream
+	"heic": "", // ISOBMFF-based; same issue
 	"pdf":  "application/pdf",
 	"txt":  "text/", "md": "text/", "csv": "text/", "log": "text/",
 	"json": "text/", // DetectContentType returns text/plain for JSON
@@ -411,8 +411,8 @@ type loginAttempt struct {
 }
 
 var (
-	loginFailsMu  sync.Mutex
-	loginFails = map[string]loginAttempt{}
+	loginFailsMu sync.Mutex
+	loginFails   = map[string]loginAttempt{}
 )
 
 func checkLoginRateLimit(ip string) bool {
@@ -943,11 +943,14 @@ type badImageError struct{ msg string }
 
 func (e badImageError) Error() string { return e.msg }
 
+// newID generates file IDs; a variable so tests can force collisions.
+var newID = randID
+
 // createUnique creates storePath/<random id>.<ext> exclusively, retrying on
 // the rare ID collision instead of overwriting someone else's file.
 func createUnique(idLen int, ext string) (*os.File, string, error) {
 	for i := 0; i < 10; i++ {
-		basename := randID(idLen) + "." + ext
+		basename := newID(idLen) + "." + ext
 		if !safeBasename.MatchString(basename) {
 			return nil, "", fmt.Errorf("unsafe basename %q", basename)
 		}
@@ -2459,6 +2462,17 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+func newMux() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleRoot)
+	mux.HandleFunc("/f/", handleFiles)
+	mux.HandleFunc("/favicon.ico", handleFavicon)
+	mux.HandleFunc("/healthz", handleHealth)
+	mux.HandleFunc("/admin", handleAdmin)
+	mux.HandleFunc("/admin/", handleAdmin)
+	return withSecureHeaders(mux)
+}
+
 func main() {
 	loadConfig()
 
@@ -2489,17 +2503,9 @@ func main() {
 
 	go startCleaner()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", handleRoot)
-	mux.HandleFunc("/f/", handleFiles)
-	mux.HandleFunc("/favicon.ico", handleFavicon)
-	mux.HandleFunc("/healthz", handleHealth)
-	mux.HandleFunc("/admin", handleAdmin)
-	mux.HandleFunc("/admin/", handleAdmin)
-
 	srv := &http.Server{
 		Addr:    port,
-		Handler: withSecureHeaders(mux),
+		Handler: newMux(),
 
 		ReadHeaderTimeout: 10 * time.Second, // Slowloris defence
 		ReadTimeout:       10 * time.Minute, // must cover slow body uploads

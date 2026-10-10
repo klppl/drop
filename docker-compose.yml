@@ -30,6 +30,7 @@ services:
       # Leave UPLOAD_TOKEN empty for open uploads.
       UPLOAD_TOKEN:    ${UPLOAD_TOKEN:-}
       REQUIRE_AUTH:    ${REQUIRE_AUTH:-}
+      UPLOAD_RATE_LIMIT: ${UPLOAD_RATE_LIMIT:-60}
       MAX_FILESIZE:    ${MAX_FILESIZE:-256}
       MAX_FILE_AGE:    ${MAX_FILE_AGE:-30}
       MIN_FILE_AGE:    ${MIN_FILE_AGE:-3}
