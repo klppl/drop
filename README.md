@@ -1,5 +1,7 @@
 # drop
 
+[![License: Lagom](https://img.shields.io/badge/license-lagom-9E2B25)](https://klppl.github.io/lagom-license/)
+
 A self-hosted file drop service. Upload files via `curl` or browser, share a short link. Dark monospace aesthetic, curl-friendly API, upload auth, an admin panel.
 
 ![Frontend](images/screenshot.png)
